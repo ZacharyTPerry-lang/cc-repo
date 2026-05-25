@@ -1,84 +1,103 @@
 -- startup.lua
 -- Runs on every boot. Fetches manifest, compares hashes, pulls changed files.
+-- Reboots only when non-startup files change. If only startup.lua changed,
+-- writes it silently and continues — picked up on the next natural reboot.
 
-local REPO = "https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/main/"
-local MANIFEST_URL = REPO .. "manifest.json"
+local REPO_BASE_URL = "https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/main/"
+local MANIFEST_URL  = REPO_BASE_URL .. "manifest.json"
+local STARTUP_PATH  = "startup.lua"
 
--- Simple FNV-1a hash for change detection
-local function hash(s)
-    local h = 2166136261
-    for i = 1, #s do
-        h = bit32.bxor(h, s:byte(i))
-        h = (h * 16777619) % 2^32
+-- FNV-1a hash matching gen_manifest.py exactly
+local function compute_hash(content)
+    local hash_value = 2166136261
+    for index = 1, #content do
+        hash_value = bit32.bxor(hash_value, content:byte(index))
+        hash_value = (hash_value * 16777619) % 2^32
     end
-    return string.format("%08x", h)
+    return string.format("%08x", hash_value)
 end
 
-local function fetch(url)
-    local res, err = http.get(url)
-    if not res then return nil, err end
-    local data = res.readAll()
-    res.close()
-    return data
+local function fetch_url(url)
+    local response, error_message = http.get(url)
+    if not response then
+        return nil, error_message
+    end
+    local content = response.readAll()
+    response.close()
+    return content
 end
 
-local function readLocal(path)
+local function read_local_file(path)
     if not fs.exists(path) then return nil end
-    local f = fs.open(path, "r")
-    local data = f.readAll()
-    f.close()
-    return data
+    local file_handle = fs.open(path, "r")
+    local content = file_handle.readAll()
+    file_handle.close()
+    return content
 end
 
-local function writeFile(path, data)
-    -- Ensure parent dirs exist
-    local dir = fs.getDir(path)
-    if dir ~= "" and not fs.exists(dir) then
-        fs.makeDir(dir)
+local function write_local_file(path, content)
+    local parent_directory = fs.getDir(path)
+    if parent_directory ~= "" and not fs.exists(parent_directory) then
+        fs.makeDir(parent_directory)
     end
-    local f = fs.open(path, "w")
-    f.write(data)
-    f.close()
+    local file_handle = fs.open(path, "w")
+    file_handle.write(content)
+    file_handle.close()
 end
 
--- Fetch and parse manifest
+-- Fetch manifest
 print("Checking for updates...")
-local manifestRaw, err = fetch(MANIFEST_URL)
-if not manifestRaw then
-    print("Could not reach GitHub: " .. tostring(err))
-    print("Running cached version...")
-    -- Fall through to run whatever is already on disk
+local manifest_raw, fetch_error = fetch_url(MANIFEST_URL)
+
+if not manifest_raw then
+    print("Could not reach GitHub: " .. tostring(fetch_error))
+    print("Running cached version.")
 else
-    local manifest = textutils.unserialiseJSON(manifestRaw)
+    local manifest = textutils.unserialiseJSON(manifest_raw)
+
     if not manifest then
-        print("Bad manifest, running cached version...")
+        print("Manifest parse failed. Running cached version.")
     else
-        local updated = 0
+        local non_startup_changed = false
+        local files_updated = 0
+
         for _, entry in ipairs(manifest.files) do
-            local localData = readLocal(entry.path)
-            local localHash = localData and hash(localData) or ""
-            if localHash ~= entry.hash then
-                print("Updating: " .. entry.path)
-                local data, ferr = fetch(REPO .. entry.path)
-                if data then
-                    writeFile(entry.path, data)
-                    updated = updated + 1
+            local local_content = read_local_file(entry.path)
+            local local_hash    = local_content and compute_hash(local_content) or ""
+
+            if local_hash ~= entry.hash then
+                local remote_content, download_error = fetch_url(REPO_BASE_URL .. entry.path)
+
+                if remote_content then
+                    write_local_file(entry.path, remote_content)
+                    files_updated = files_updated + 1
+
+                    if entry.path ~= STARTUP_PATH then
+                        non_startup_changed = true
+                    end
                 else
-                    print("  WARN: failed to fetch " .. entry.path .. ": " .. tostring(ferr))
+                    print("WARN: could not fetch " .. entry.path .. ": " .. tostring(download_error))
                 end
             end
         end
-        if updated > 0 then
-            print(updated .. " file(s) updated. Rebooting...")
-            os.sleep(0.5)
-            os.reboot()
+
+        if files_updated > 0 then
+            print(files_updated .. " file(s) updated.")
         else
             print("Up to date.")
+        end
+
+        -- Only reboot if something other than startup.lua changed.
+        -- startup.lua changes take effect on the next natural reboot.
+        if non_startup_changed then
+            print("Rebooting to apply changes...")
+            os.sleep(0.5)
+            os.reboot()
         end
     end
 end
 
--- Run main program if it exists
+-- Run main program if present
 if fs.exists("programs/main.lua") then
     shell.run("programs/main.lua")
 else

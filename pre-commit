@@ -1,0 +1,7 @@
+#!/bin/sh
+# .git/hooks/pre-commit
+# Auto-regenerates manifest.json before every commit.
+
+echo "Regenerating manifest.json..."
+python gen_manifest.py
+git add manifest.json

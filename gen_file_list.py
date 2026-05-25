@@ -12,9 +12,8 @@ EXCLUDE = {"bootstrap.lua"}
 
 # Get current commit SHA (this will be the SHA after commit via hook)
 sha_result = subprocess.run(
-    ["git", "rev-parse", "HEAD"],
-    capture_output=True,
-    text=True
+    ["git", "write-tree"],
+    capture_output=True, text=True
 )
 sha = sha_result.stdout.strip()
 

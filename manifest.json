@@ -1,12 +1,8 @@
 {
   "files": [
     {
-      "path": "/bootstrap.lua",
-      "hash": "815c46ff"
-    },
-    {
-      "path": "/startup.lua",
-      "hash": "1bc8bc92"
+      "path": "startup.lua",
+      "hash": "64160aaa"
     }
   ]
 }

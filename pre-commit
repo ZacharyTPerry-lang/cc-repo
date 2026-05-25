@@ -3,5 +3,5 @@
 # Auto-regenerates manifest.json before every commit.
 
 echo "Regenerating manifest.json..."
-python gen_manifest.py
+python3 gen_manifest.py
 git add manifest.json

@@ -9,7 +9,7 @@ Run manually before committing when lua files are added or removed:
 import json
 import subprocess
 
-EXCLUDE = {"bootstrap.lua"}
+EXCLUDE = {"bootstrap.lua", "CC_NETWORK_DESIGN.md"}
 
 result = subprocess.run(
     ["git", "ls-files"],

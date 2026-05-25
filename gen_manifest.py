@@ -9,7 +9,7 @@ import json
 import os
 import hashlib
 
-EXCLUDE = {"bootstrap.lua"}  # bootstrap is one-time, not managed by updater
+EXCLUDE = {"bootstrap.lua", "manifest.json"}  # bootstrap is one-time, not managed by updater
 
 def fnv1a(data: bytes) -> str:
     h = 2166136261

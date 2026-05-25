@@ -1,7 +1,7 @@
 #!/bin/sh
 # .git/hooks/pre-commit
-# Auto-regenerates file_list.json before every commit.
+# Regenerates file_list.json and deployed_sha.txt before every commit.
 
-echo "Regenerating file_list.json..."
+echo "Regenerating file list and SHA..."
 python3 gen_file_list.py
-git add file_list.json
+git add file_list.json deployed_sha.txt

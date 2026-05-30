@@ -1,0 +1,11 @@
+{
+  "banned": [
+    "bootstrap.lua",
+    "CC_NETWORK_DESIGN.md",
+    "deploy_banlist.json",
+    "gen_file_list.py",
+    "branch_manager.py",
+    "LICENSE",
+    ".gitignore"
+  ]
+}

@@ -9,17 +9,18 @@
 -- their headers for this branch, writes the
 -- new SHA, and reboots if non-self files
 -- changed. Drops to shell after sync.
+-- If no role.cfg exists, fetches and runs
+-- configure_pc.lua to assign a role.
 --
--- Branches : main
---            interactive_role_selector
+-- Branches : main, interactive_role_selector,
 --            node/test
 -- Depends  : none
 -- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 --
--- [1] CONFIGURATION       ln. 20
--- [2] FILE OPERATIONS     ln. 32
--- [3] SYNC                ln. 57
--- [4] ENTRY POINT         ln. 120
+-- [1] CONFIGURATION       ln. 22
+-- [2] FILE OPERATIONS     ln. 34
+-- [3] SYNC                ln. 60
+-- [4] ENTRY POINT         ln. 125
 --
 -- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -27,12 +28,13 @@
 -- [1] CONFIGURATION
 -- ===========================================================================
 
-local GITHUB_API_COMMIT_URL  = "https://api.github.com/repos/ZacharyTPerry-lang/cc-repo/commits/main"
-local GITHUB_RAW_BASE_URL    = "https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/main/"
-local DEPLOY_BANLIST_PATH    = "deploy_banlist.json"
-local DEPLOYED_SHA_PATH      = ".deployed_sha"
+local GITHUB_API_BASE_URL     = "https://api.github.com/repos/ZacharyTPerry-lang/cc-repo/commits/"
+local GITHUB_RAW_BASE_URL     = "https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/"
+local DEPLOY_BANLIST_FILENAME = "deploy_banlist.json"
+local FILE_INDEX_FILENAME     = "file_index.json"
+local DEPLOYED_SHA_PATH       = ".deployed_sha"
 local ROLE_CONFIGURATION_PATH = "role.cfg"
-local STARTUP_FILE_PATH      = "startup.lua"
+local STARTUP_FILE_PATH       = "startup.lua"
 
 -- ===========================================================================
 -- [2] FILE OPERATIONS
@@ -70,7 +72,7 @@ end
 -- [3] SYNC
 -- ===========================================================================
 
-local function read_role_branch()
+local function read_configured_branch()
     local role_content = read_local_file(ROLE_CONFIGURATION_PATH)
     if not role_content then return "main" end
     local branch = role_content:match("branch=([^\n]+)")
@@ -78,11 +80,11 @@ local function read_role_branch()
 end
 
 local function build_api_url(branch)
-    return "https://api.github.com/repos/ZacharyTPerry-lang/cc-repo/commits/" .. branch
+    return GITHUB_API_BASE_URL .. branch
 end
 
 local function build_raw_url(branch, file_path)
-    return "https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/" .. branch .. "/" .. file_path
+    return GITHUB_RAW_BASE_URL .. branch .. "/" .. file_path
 end
 
 local function fetch_remote_sha(branch)
@@ -99,19 +101,23 @@ local function fetch_remote_sha(branch)
 end
 
 local function fetch_banlist(branch)
-    local raw, error_message = fetch_url(build_raw_url(branch, DEPLOY_BANLIST_PATH))
+    local raw, error_message = fetch_url(
+        build_raw_url(branch, DEPLOY_BANLIST_FILENAME)
+    )
     if not raw then return nil, error_message end
     local banlist = textutils.unserialiseJSON(raw)
     if not banlist then return nil, "Failed to parse deploy_banlist.json" end
-    local banned  = {}
+    local banned = {}
     for _, entry in ipairs(banlist.banned) do
         banned[entry] = true
     end
     return banned
 end
 
-local function fetch_file_list(branch)
-    local raw, error_message = fetch_url(build_raw_url(branch, "file_index.json"))
+local function fetch_file_index(branch)
+    local raw, error_message = fetch_url(
+        build_raw_url(branch, FILE_INDEX_FILENAME)
+    )
     if not raw then return nil, error_message end
     local file_index = textutils.unserialiseJSON(raw)
     if not file_index then return nil, "Failed to parse file_index.json" end
@@ -127,9 +133,9 @@ local function sync_branch(branch, remote_sha)
         return false
     end
 
-    local file_list, file_list_error = fetch_file_list(branch)
+    local file_list, file_list_error = fetch_file_index(branch)
     if not file_list then
-        print("Could not fetch file list: " .. tostring(file_list_error))
+        print("Could not fetch file index: " .. tostring(file_list_error))
         return false
     end
 
@@ -138,7 +144,9 @@ local function sync_branch(branch, remote_sha)
 
     for _, file_path in ipairs(file_list) do
         if not banlist[file_path] then
-            local content, download_error = fetch_url(build_raw_url(branch, file_path))
+            local content, download_error = fetch_url(
+                build_raw_url(branch, file_path)
+            )
             if content then
                 write_local_file(file_path, content)
                 files_updated = files_updated + 1
@@ -146,7 +154,8 @@ local function sync_branch(branch, remote_sha)
                     non_startup_changed = true
                 end
             else
-                print("WARN: failed to fetch " .. file_path .. ": " .. tostring(download_error))
+                print("WARN: failed to fetch " .. file_path
+                    .. ": " .. tostring(download_error))
             end
         end
     end
@@ -160,11 +169,12 @@ end
 -- [4] ENTRY POINT
 -- ===========================================================================
 
-local configured_branch = read_role_branch()
-
 if not fs.exists(ROLE_CONFIGURATION_PATH) then
     print("No role.cfg found. Fetching configurator...")
-    local configurator_url = build_raw_url("interactive_role_selector", "configure_pc.lua")
+    local configurator_url = build_raw_url(
+        "interactive_role_selector",
+        "configure_pc.lua"
+    )
     local content, fetch_error = fetch_url(configurator_url)
     if content then
         write_local_file("configure_pc.lua", content)
@@ -176,7 +186,9 @@ if not fs.exists(ROLE_CONFIGURATION_PATH) then
     return
 end
 
+local configured_branch = read_configured_branch()
 print("Checking for updates on branch: " .. configured_branch)
+
 local remote_sha, sha_error = fetch_remote_sha(configured_branch)
 
 if not remote_sha then
@@ -203,5 +215,5 @@ end
 if fs.exists("programs/main.lua") then
     shell.run("programs/main.lua")
 else
-    print("Ready. No programs/main.lua found.")
+    print("Ready.")
 end

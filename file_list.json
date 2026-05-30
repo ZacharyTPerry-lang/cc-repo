@@ -1,5 +1,6 @@
 {
   "files": [
+    "configure_pc.lua",
     "startup.lua"
   ]
 }

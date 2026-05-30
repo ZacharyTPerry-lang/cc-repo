@@ -1,6 +1,7 @@
 {
   "files": [
     "configure_pc.lua",
-    "startup.lua"
+    "startup.lua",
+    "wipe.lua"
   ]
 }

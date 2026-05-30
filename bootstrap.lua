@@ -1,6 +1,16 @@
+-- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 -- bootstrap.lua
--- Paste once into a fresh CC computer to initialize the updater.
--- Fetches startup.lua from the repo and reboots into it.
+-- One-time initialization utility.
+-- Paste into a fresh CC computer to pull
+-- startup.lua from the main branch and reboot
+-- into the sync system. After this runs,
+-- startup.lua handles all future updates.
+-- Never deployed to CC computers by the sync
+-- system. Listed in deploy_banlist.json.
+--
+-- Branches : none (one-time paste only)
+-- Depends  : none
+-- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 local REPO_BASE_URL = "https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/main/"
 

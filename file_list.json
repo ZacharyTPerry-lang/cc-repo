@@ -1,5 +1,6 @@
 {
   "files": [
-    "startup.lua"
+    "startup.lua",
+    "test_role_hello.lua"
   ]
 }

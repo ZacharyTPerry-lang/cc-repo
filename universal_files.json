@@ -1,0 +1,7 @@
+{
+  "universal": [
+    "deploy_banlist.json",
+    "universal_files.json",
+    "gen_file_list.py"
+  ]
+}

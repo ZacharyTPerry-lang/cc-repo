@@ -12,10 +12,13 @@ Multi-line continuation format:
     -- Branches : main, interactive_role_selector,
     --            node/test
 
+Special value:
+    -- Branches : all
+    File is deployed to every branch without exception.
+
 Continuation lines are any comment lines immediately following
 the Branches declaration that contain no colon and are not
-a new header field. All branches are collected across all
-continuation lines and split on commas.
+a new header field.
 
 Files with no branch declaration are a hard error — deploy aborts.
 Files listed in deploy_banlist.json are excluded regardless
@@ -28,16 +31,20 @@ Run before committing when lua files are added or removed:
 import json
 import subprocess
 import sys
+import os
 
 BANLIST_PATH        = "deploy_banlist.json"
 FILE_INDEX_PATH     = "file_index.json"
 BRANCH_TAG          = "-- Branches :"
 CONTINUATION_PREFIX = "--"
+UNIVERSAL_VALUE     = "all"
 
 def load_banlist():
+    if not os.path.exists(BANLIST_PATH):
+        return set()
     with open(BANLIST_PATH, "r") as banlist_file:
         banlist_data = json.load(banlist_file)
-    return set(banlist_data["banned"])
+    return set(banlist_data.get("banned", []))
 
 def get_current_branch():
     result = subprocess.run(
@@ -59,7 +66,7 @@ def get_tracked_lua_files():
 def read_branch_declaration(file_path):
     """
     Reads the Branches declaration from a lua file header.
-    Handles both single-line and multi-line continuation formats.
+    Handles single-line, multi-line continuation, and 'all' value.
     Returns a list of branch names, or None if no declaration found.
     """
     try:
@@ -78,8 +85,6 @@ def read_branch_declaration(file_path):
                     continue
 
                 if found_declaration:
-                    # Continuation line: starts with -- and contains
-                    # no colon (colon would indicate a new header field)
                     if (stripped.startswith(CONTINUATION_PREFIX)
                             and ":" not in stripped):
                         continuation = stripped[len(CONTINUATION_PREFIX):].strip()
@@ -87,7 +92,6 @@ def read_branch_declaration(file_path):
                             branch_lines.append(continuation)
                         continue
                     else:
-                        # Hit a new field or non-comment line — stop
                         break
 
             if not found_declaration:
@@ -104,6 +108,15 @@ def read_branch_declaration(file_path):
     except Exception as read_error:
         print(f"ERROR: Could not read {file_path}: {read_error}")
         sys.exit(1)
+
+def file_belongs_on_branch(declared_branches, current_branch):
+    """
+    Returns True if the file should be deployed to current_branch.
+    Handles the special 'all' value.
+    """
+    if UNIVERSAL_VALUE in declared_branches:
+        return True
+    return current_branch in declared_branches
 
 def main():
     banlist        = load_banlist()
@@ -129,8 +142,9 @@ def main():
             errors_found = True
             continue
 
-        if current_branch in declared_branches:
-            print(f"  INCLUDE : {file_path}")
+        if file_belongs_on_branch(declared_branches, current_branch):
+            label = "UNIVERSAL" if UNIVERSAL_VALUE in declared_branches else "INCLUDE"
+            print(f"  {label:<8}: {file_path}")
             print(f"            branches: {', '.join(declared_branches)}")
             files_for_branch.append(file_path)
         else:

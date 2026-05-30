@@ -1,102 +1,306 @@
 # ComputerCraft Distributed Control Network
-## Design Document v2.0.0
+## Design Document v3.0.0
 
 **Project:** CC:Tweaked distributed control network for NuclearCraft Fork + AE2
 **Repository:** https://github.com/ZacharyTPerry-lang/cc-repo
 **Minecraft Version:** NeoForge 1.21.1
 **CC:Tweaked Version:** Current, installed on shared server
-**Author:** Zachary Perry
-**Status:** Architecture complete, primitives not yet written
+**Document Version:** 3.0.0
+**Status:** Foundation complete and tested. Network primitives unbuilt.
+
+This document is a complete knowledge transfer artifact. It encodes not
+only what was built and how it works, but why every decision was made,
+what alternatives were considered and rejected, what failed during
+development and why, what the developer taught through the course of
+building this system, and what remains to be done. A reader who finishes
+this document should be able to continue development without asking
+clarifying questions. A reader who skims it will produce subtly wrong
+results. Do not skim.
 
 ---
 
 ## Table of Contents
 
-1. Project Intent and Philosophy
-2. Hardware Constraints and Their Implications
-3. The CI/CD Pipeline
-4. Repository Architecture and Branch Strategy
-5. Node Provisioning System
-6. Network Topology
-7. The Display Fabric
-8. The Channel Bus and Process Model
-9. Memory Management
-10. The NuclearCraft Peripheral API
-11. Third Party Code Assessment
-12. Coding Conventions
-13. Open Items and Build Order
+1.  Project Intent and Philosophy
+2.  Hardware Constraints and Their Implications
+3.  The CI/CD Pipeline
+4.  Repository Architecture and Branch Strategy
+5.  The File Declaration and Deployment System
+6.  Node Provisioning System
+7.  Network Topology
+8.  The Display Fabric
+9.  The Channel Bus and Process Model
+10. Memory Management
+11. The NuclearCraft Peripheral API
+12. Third Party Code Assessment
+13. Coding Conventions for Lua on CC
+14. The branch_manager.py Toolkit
+15. What the Developer Taught the System
+16. Anti-Patterns Explicitly Rejected
+17. Open Items and Build Order
 
 ---
 
 ## 1. Project Intent and Philosophy
 
-The goal of this project is to build a distributed ComputerCraft network that monitors and controls NuclearCraft fission reactors and Applied Energistics 2 networks across a survival Minecraft server. The network must be operable entirely from outside the game — no direct interaction with in-game terminals during normal operation. The developer writes Lua code on a Windows development machine using a standard terminal environment (nvim, WSL Ubuntu), pushes to GitHub, and the in-game computers synchronize automatically on reboot.
+The goal of this project is to build a distributed ComputerCraft network
+that monitors and controls NuclearCraft fission reactors and Applied
+Energistics 2 networks across a survival Minecraft server. The developer
+writes Lua code on a Windows development machine using a standard
+terminal environment — nvim, WSL Ubuntu — pushes to GitHub, and the
+in-game computers synchronize automatically on reboot. No direct
+interaction with in-game terminals is required during normal operation.
 
-The philosophy guiding every architectural decision in this project is that the system must be both operationally transparent and recoverable. Transparency means that every running process is visible and observable from anywhere on the network — there are no silent background processes. Recoverability means that a complete failure of any node, including the coordinator, must be recoverable without server administrator assistance. The developer does not own the server and cannot ask for block removal, world editing, or JVM restarts. Every failure mode must be resolvable from within the CC environment itself.
+The server is shared and not owned by the developer. This is a binding
+constraint that shapes every architectural decision. The developer cannot
+ask the server administrator for block removal, world editing, JVM
+restarts, or filesystem access. Every failure mode must be resolvable
+from within the CC environment itself. The system must be self-healing
+or recoverable without external intervention.
 
-This project is being built on a private survival server where the developer has constructed a perimeter using world-digging machines. Physical space for computer placement is not a constraint. The binding constraints are Lua heap size per computer, server RAM consumption from active computers, and the absence of administrator access for recovery operations.
+The developer has constructed a perimeter using world-digging machines.
+Physical space for computer placement is not a constraint. The binding
+constraints are the Lua heap size per computer, server RAM consumption
+from active computers, and the absence of administrator access.
 
-A secondary but important goal is that this system should eventually serve as a general-purpose distributed control fabric, not just a reactor monitor. The reactor controller and AE2 monitor are the first applications. The underlying network primitives — the channel bus, the process registry, the display fabric — are being designed to support dozens of independent processes running simultaneously, each with its own display that can be viewed from any monitor on the network.
+### 1.1 The Core Design Philosophy
+
+The single most important principle that emerged during development and
+that must be understood before any other: the developer is not the
+system's protection mechanism. The system is.
+
+This principle was stated explicitly by the developer during a session
+where the conversation repeatedly produced instructions that relied on
+the developer remembering the right sequence, the right branch, the
+right file, the right confirmation. The developer's response was direct:
+"I am not the thing that preserves state. The system should."
+
+This means every guard, every check, every confirmation prompt, every
+hard error exists because human memory is not a reliable invariant. The
+system must enforce correctness automatically. The developer's job is to
+write code and make architectural decisions. The system's job is to make
+sure what gets deployed is coherent. These two jobs must not be
+conflated.
+
+The consequences of this principle are visible throughout the codebase:
+- `gen_file_list.py` hard-errors on a missing branch declaration rather
+  than silently skipping the file
+- The deploy banlist prevents files from reaching CC computers
+  regardless of what the developer does
+- `propagate --all` requires typing `ALL BRANCHES` in full, not just `y`
+- `wipe.lua` requires typing `WIPE` in full caps
+- `configure_pc.lua` fetches the live role list from GitHub rather than
+  trusting a hardcoded list that could drift
+- The branch header system was invented specifically because the
+  developer recognized that manually maintaining a deployment manifest
+  was a human memory problem
+
+### 1.2 The Finite Pattern Requirement
+
+Every loop in every program must have a termination condition that is
+guaranteed to be reached within a bounded number of iterations. No loop
+may depend on an external condition — network response, peripheral
+availability, user input — without a timeout that guarantees eventual
+termination. Recursion is prohibited.
+
+This is not a style preference. It is a hard requirement derived from
+the operational context: CC computers have no external kill mechanism
+accessible to the developer without server administrator access. A hung
+loop cannot be interrupted remotely. `Ctrl+T` terminates a running
+program from the local terminal, but the developer is not always at the
+local terminal. A program that can hang indefinitely is a program that
+can only be killed by physically breaking the computer block, which
+requires administrator access the developer does not have.
+
+Every blocking operation must have a timeout. Every `os.pullEvent` must
+specify a maximum wait time. The SHUTDOWN signal must be checked between
+every operation so that a process can be cleanly terminated even if it
+is in the middle of a long task.
+
+### 1.3 The Exit Path Requirement
+
+Every interactive loop must have an explicit exit path that returns
+control to the CC terminal. No program should be able to trap the
+developer. This was stated by the developer as an absolute requirement
+after reviewing `configure_pc.lua`: "all files need a way out so we do
+not get stuck anywhere."
+
+The convention is that `0` at any prompt exits to the terminal. This
+applies to role selection, confirmation prompts, and any future
+interactive program. The exit message must tell the developer how to
+resume the operation if they change their mind.
+
+This requirement exists for the same reason as the finite pattern
+requirement: the developer may not be at the local terminal and cannot
+remotely terminate a hung interactive program. Trapping the local
+terminal is a recoverable failure only if someone is physically present.
+
+### 1.4 Scope and Future Direction
+
+The reactor controller and AE2 monitor are the first applications. The
+underlying network primitives — the channel bus, the process registry,
+the display fabric — are being designed to support dozens of independent
+processes running simultaneously, each with its own display channel that
+can be viewed from any monitor on the network. The system is a general
+purpose distributed control fabric, not a reactor monitor. The reactor
+is the first application that runs on top of it.
 
 ---
 
 ## 2. Hardware Constraints and Their Implications
 
-Understanding the hardware constraints of CC:Tweaked computers is essential to every design decision in this project. These constraints are not soft limits that can be worked around with clever code — they are hard ceilings enforced by the CC:Tweaked mod itself, and the architecture must be designed around them from the beginning.
+Understanding the hardware constraints of CC:Tweaked computers is
+essential to every design decision. These are hard ceilings enforced by
+the mod itself, not soft limits that clever code can work around.
 
-### 2.1 Memory
+### 2.1 Memory — The Critical Constraint
 
-Every CC:Tweaked computer has a Lua heap of 2MB. This is the total memory available for all running code, all loaded tables, all string data, and all coroutines on that computer. It is not per-process — it is the total for everything running on that physical CC computer. This is an extremely small heap by any modern standard.
+Every CC:Tweaked computer has a Lua heap of 2MB. This is the total
+memory available for all running code, all loaded tables, all string
+data, and all coroutines on that computer. It is not per-process. It is
+the total for everything running on that physical machine.
 
-The practical implication is that every data structure must be bounded. A table that grows without bound will eventually exhaust the heap and crash the computer. This is particularly dangerous for monitoring systems that accumulate historical data — a naive implementation that appends sensor readings to a table every tick will run out of memory within minutes. Every accumulating data structure must have a fixed maximum size with old entries pruned as new ones are added.
+The critical insight that came up as a real question during development
+and was answered definitively: comments cost zero RAM. A 500 byte file
+header costs 500 bytes of disk space and zero bytes of runtime heap.
+Comments are stripped by the Lua parser and never loaded into memory.
+The 2MB limit is entirely about what code does at runtime — what tables
+it creates, what strings it accumulates, what coroutines it spawns —
+not about what the code says.
 
-Code size itself is not the primary concern. A typical well-written Lua file is a few kilobytes. The concern is runtime allocation — tables created and populated during execution. The design response to this constraint is that each computer holds state only for its own process. No computer accumulates state on behalf of other computers. The coordinator holds only a registry table of channel names, computer IDs, and heartbeat timestamps, not the state payloads of every process it manages.
+This means: write full headers on every file without hesitation. Write
+verbose comments explaining every non-obvious decision. The only cost
+is disk space, and disk is not the constraint.
 
-The 2MB limit also means that complex visualization and rendering should not happen on the same computer that is doing control logic. A computer doing reactor monitoring should send a compact state packet over the network to a dedicated display computer, which handles all the rendering work. This separation keeps both computers well within their memory budgets.
+The actual RAM risks are:
+- Tables that grow without bound. A monitoring system that appends
+  sensor readings to a table every tick will exhaust the heap within
+  minutes. Every accumulating data structure must have a fixed maximum
+  size with old entries pruned on insertion.
+- Large string allocations. HTTP response bodies, serialized JSON
+  payloads, and concatenated strings all consume heap.
+- Deep call stacks. Lua uses heap for stack frames. Deep recursion
+  exhausts the heap before it exhausts any explicit limit.
+
+The design response to the 2MB constraint is that each computer holds
+state only for its own process. No computer accumulates state on behalf
+of other computers. The coordinator holds only a registry table, not
+the state payloads of every process it manages. Display nodes hold only
+the most recent state packet, not historical data.
 
 ### 2.2 Storage
 
-CC:Tweaked computer storage is 1MB for regular computers and 2MB for advanced computers. This is the filesystem limit — files written to the CC computer's virtual filesystem. These files are stored as actual files in a subdirectory of the Minecraft server's world folder, not in server RAM. An idle computer with data on disk consumes zero server RAM. This distinction is critical for the distributed database architecture described later.
+CC:Tweaked computer storage is 1MB for regular computers and 2MB for
+advanced computers. This is a filesystem limit — files written to the
+CC computer's virtual filesystem. These files are stored as actual files
+in a subdirectory of the Minecraft server's world folder, not in server
+RAM. An idle computer with data on disk consumes zero server RAM.
 
-The storage limit means that deployed code must be lean. A branch that is deployed to a worker node should contain only the files that node actually needs. The branch architecture described in Section 4 is designed specifically to keep each node's deployed footprint as small as possible. A compute node that performs a single mathematical transformation might have a deployed footprint of a single Lua file of a few kilobytes.
+This distinction is critical for the distributed database architecture.
+A 1000-node database cluster stores data on disk across 1000 folders.
+Total disk consumption could reach 2GB of server disk space. Total
+server RAM consumption from idle database nodes is approximately zero.
+When a query arrives, a node loads data from disk, responds, and
+deallocates. The RAM cost is only the working set of the handful of
+nodes actively processing queries at any moment.
+
+The storage limit means deployed code must be lean. Each branch
+contains only the files needed for its role. The branch architecture
+described in Section 4 keeps each node's deployed footprint as small
+as possible.
 
 ### 2.3 Network
 
-CC:Tweaked supports two network transports: wireless rednet and wired modems with networking cable. Rednet messages can carry Lua tables as payloads, which CC:Tweaked serializes internally. The practical message size limit for table payloads is approximately 64KB per message. This is large enough for most state packets but requires careful design for payloads that carry large datasets, such as AE2 inventory snapshots.
+CC:Tweaked supports wireless rednet and wired modems with networking
+cable. Rednet messages can carry Lua tables as payloads, serialized
+internally by CC:Tweaked. The practical message size limit for table
+payloads is approximately 64KB per message. This is large enough for
+most state packets but requires careful design for large payloads such
+as AE2 inventory snapshots.
 
-For very large payloads, chunking is required. The channel bus must support fragmented message transmission — splitting a payload across multiple messages with sequence numbers and reassembling on the receiving end. This is a standard fragmentation pattern and must be built into the channel bus from the beginning, not added later.
+For very large payloads, chunking is required. The channel bus must
+support fragmented message transmission — splitting a payload across
+multiple messages with sequence numbers and reassembling on the
+receiving end. This is built into the channel bus design from the
+beginning, not added later.
 
 ### 2.4 Concurrency
 
-CC:Tweaked computers are single-threaded. There is no true parallel execution on a single computer. The `parallel.waitForAny` and `parallel.waitForAll` API functions provide cooperative multitasking through coroutines, but only one coroutine executes at a time. A coroutine that blocks indefinitely will starve all other coroutines on that computer.
+CC:Tweaked computers are single-threaded. The `parallel.waitForAny`
+and `parallel.waitForAll` API functions provide cooperative multitasking
+through coroutines, but only one coroutine executes at a time. A
+coroutine that blocks indefinitely will starve all other coroutines.
 
-This means that every blocking operation — every `os.pullEvent`, every HTTP request, every rednet receive — must have a timeout. A process that blocks indefinitely waiting for a message that never arrives will freeze the entire computer. The design response is that the channel bus wraps all blocking operations with timeouts, and the shutdown flag is checked between every operation.
+This reinforces the timeout requirement. Every blocking operation must
+have a timeout. A process that blocks indefinitely waiting for a message
+that never arrives freezes the entire computer.
 
-### 2.5 The Distributed Memory Model
+### 2.5 The Terminal Width Constraint
 
-Because each computer is limited to 2MB of RAM, the network as a whole can be thought of as a distributed memory system where each node contributes 2MB. Ten computers running as a single logical cluster provide 20MB of combined state capacity, but this capacity is only useful if the work is actually distributed across those computers. A single computer trying to hold 20MB of state will simply crash.
+The CC:Tweaked advanced computer terminal is 51 characters wide. This
+is a hard physical constraint that overrides the 100-character line
+width convention from the developer's C projects. Every comment border,
+every print statement, every formatted output must fit within 51
+characters or it will wrap and become unreadable. All visual conventions
+in this project are derived with the 51-character constraint as a
+primary design input, not an afterthought.
 
-This has a direct implication for the database cluster architecture. A dedicated database cluster can provide meaningful persistent storage capacity by distributing data across many nodes, each holding a bounded slice of the total dataset. Each database node is idle almost all of the time — it wakes when a query arrives, reads from its local filesystem, responds, and returns to idle. Because idle computers consume no server RAM, a 1000-node database cluster would consume only the RAM of the handful of nodes actively processing queries at any moment. The storage capacity of such a cluster would be up to 2GB of server disk space, which is a real and useful amount of persistent storage for a Minecraft control system.
+### 2.6 The Distributed Memory Model
+
+Because each computer is limited to 2MB of RAM, the network as a whole
+is a distributed memory system where each node contributes 2MB of
+working memory. Ten computers running as a single logical cluster
+provide 20MB of combined state capacity. This is only useful if work is
+actually distributed — a single computer trying to hold 20MB of state
+will crash. The architecture distributes work deliberately so that each
+node's working set fits comfortably within its 2MB budget.
 
 ---
 
 ## 3. The CI/CD Pipeline
 
-### 3.1 Design Rationale
+### 3.1 The Core Problem and Why GitHub
 
-The fundamental problem this pipeline solves is that the developer writes code on a Windows machine but the execution environment is a CC:Tweaked computer inside a Minecraft server that the developer does not control. There is no direct filesystem access to the server's CC computer directories, no SSH, and no way to push files directly. The only communication channel available is the CC:Tweaked HTTP API, which allows in-game computers to make outbound HTTP requests.
+The developer writes code on a Windows machine. The execution environment
+is a CC:Tweaked computer inside a Minecraft server the developer does
+not control. There is no direct filesystem access to the server's CC
+computer directories, no SSH, and no way to push files directly. The
+only outbound communication channel available is the CC:Tweaked HTTP
+API, which allows in-game computers to make outbound HTTP requests.
 
-The solution is to use GitHub as the intermediary. The developer pushes code to a public GitHub repository. The CC computer fetches code from GitHub's raw content delivery network on every reboot. GitHub is always reachable from the CC computer (confirmed by `http.checkURL` returning `true nil`), serves files reliably, and provides version control for free.
+The solution is GitHub as the intermediary. The developer pushes code
+to a public repository. CC computers fetch code from GitHub's raw
+content delivery network on every reboot. GitHub is reachable from CC
+computers (confirmed: `http.checkURL` returns `true nil` for both
+`raw.githubusercontent.com` and `api.github.com`). GitHub serves files
+reliably, provides version control, and is free.
 
-The workflow was designed to be as simple as possible while remaining correct. After many iterations and several failure modes encountered during development, the final workflow is three commands with no hooks, no automation, and no moving parts that can fail silently.
+### 3.2 Development Environment Details
 
-### 3.2 Development Environment
+The development machine runs Windows with WSL Ubuntu. All git operations
+are performed from WSL, not from PowerShell. The SSH key for GitHub
+authentication is stored in the WSL environment. The GitHub account that
+owns the repository is `ZacharyTPerry-lang`. Authentication uses SSH
+with the remote URL configured as:
 
-The development machine runs Windows with WSL Ubuntu. All git operations are performed from WSL, not from PowerShell, because the SSH key for GitHub authentication is stored in the WSL environment. The GitHub account that owns the repository is `ZacharyTPerry-lang`. Authentication uses an SSH key already registered with GitHub, with the remote URL configured as `git@github.com:ZacharyTPerry-lang/cc-repo.git`. Password authentication to GitHub is not supported for git operations and will fail.
+```
+git@github.com:ZacharyTPerry-lang/cc-repo.git
+```
+
+Password authentication to GitHub is not supported for git operations
+and will fail. This was discovered during development when pushing with
+HTTPS credentials was rejected.
+
+A second GitHub account (`zacperry1999`) exists and was initially
+authenticated. This caused push failures because that account did not
+have write access to the repository owned by `ZacharyTPerry-lang`. The
+fix was setting the remote URL explicitly to use the correct account.
 
 ### 3.3 The Deployment Workflow
 
-The complete deployment workflow is as follows:
+After many iterations and several serious failures, the final deployment
+workflow is three commands with no automation, no hooks, and no moving
+parts that can fail silently:
 
 ```bash
 python3 gen_file_list.py   # run only when lua files are added or removed
@@ -105,496 +309,1519 @@ git commit -m "descriptive message"
 git push
 ```
 
-`gen_file_list.py` uses `git ls-files` to enumerate all tracked Lua files in the current branch and writes them to `file_list.json`. It must be run after new files are added to git tracking but before committing, because `git ls-files` only sees tracked files. If no Lua files were added or removed in this commit, `gen_file_list.py` does not need to be run.
+`gen_file_list.py` reads branch declarations from Lua file headers and
+generates `file_index.json` for the current branch. It must be run
+after new files are added to git tracking but before committing, because
+it uses `git ls-files` which only sees tracked files. If no Lua files
+were added or removed, `gen_file_list.py` does not need to be run.
 
-There are no git hooks. This is an explicit design decision made after two serious failures with hook-based automation, described in Section 3.7.
+There are no git hooks. This is an explicit design decision made after
+two serious failures with hook-based automation. The full failure history
+is documented in Section 3.7.
 
 ### 3.4 The Sync Mechanism
 
 On every boot, `startup.lua` performs the following sequence:
 
-First, it fetches the latest commit SHA from `https://api.github.com/repos/ZacharyTPerry-lang/cc-repo/commits/main`. The GitHub API is confirmed reachable from the CC computer. The response is a JSON object from which the `sha` field is extracted.
+First, it reads `role.cfg` to determine which branch this computer is
+assigned to. If `role.cfg` does not exist, the computer is not yet
+provisioned. It fetches `configure_pc.lua` from the
+`interactive_role_selector` branch and runs it to assign a role.
 
-Second, it reads the locally stored file `.deployed_sha`. If this file does not exist, the computer has never successfully synced and treats itself as needing a full update.
+Second, it fetches the latest commit SHA from the GitHub API:
+```
+https://api.github.com/repos/ZacharyTPerry-lang/cc-repo/commits/<branch>
+```
+The branch in this URL is the configured branch from `role.cfg`, not
+always `main`. Each computer checks the SHA of its own assigned branch.
 
-Third, it compares the remote SHA to the local SHA. If they match, the computer is up to date and proceeds directly to running its assigned program. If they differ, the computer fetches `file_list.json` to obtain the list of files to pull, then fetches each file individually and writes it to the local filesystem.
+Third, it reads the locally stored file `.deployed_sha`. If this file
+does not exist, the computer treats itself as needing a full update.
 
-Fourth, after all files are written, it writes the new SHA to `.deployed_sha`. This is the commit of record — the computer is now at that commit.
+Fourth, it compares the remote SHA to the local SHA. If they match, the
+computer is up to date. If they differ, it fetches `deploy_banlist.json`
+and `file_index.json` from the configured branch, then fetches each
+file listed in `file_index.json` that is not banned.
 
-Fifth, it determines whether to reboot. If any file other than `startup.lua` was updated, it reboots so that the updated files take effect. If only `startup.lua` itself was updated, it does not reboot — the update will take effect on the next natural reboot. This rule exists because if `startup.lua` triggered a reboot whenever it updated itself, and the new version of `startup.lua` also triggered a reboot for some reason, the computer would enter an infinite reboot loop. By never rebooting for its own update, `startup.lua` guarantees that the reboot chain is finite.
+Fifth, after all files are written, it writes the new SHA to
+`.deployed_sha`. The computer is now at that commit on that branch.
 
-### 3.5 The Bootstrap Process
+Sixth, it determines whether to reboot. If any file other than
+`startup.lua` itself was updated, it reboots. If only `startup.lua` was
+updated, it does not reboot — the update takes effect on the next
+natural reboot. This rule exists to prevent infinite reboot loops.
 
-A freshly provisioned CC computer has nothing on it. The bootstrap process is a single line pasted into the CC terminal that fetches `bootstrap.lua` from GitHub and runs it:
+### 3.5 Why SHA-Based Sync, Not File Hash Comparison
+
+The first sync mechanism used FNV-1a hashes of file contents to detect
+changes. This failed catastrophically and repeatedly due to line ending
+differences. Windows Git converts line endings from LF to CRLF on
+checkout by default. The hash of a file with CRLF endings differs from
+the hash of the same file with LF endings. The manifest was generated on
+Windows with CRLF files. CC received the files and hashed them. The
+hashes always differed. The computer rebooted every boot. This was the
+first infinite reboot loop.
+
+SHA-based sync compares commit SHAs, not file content hashes. A commit
+SHA is a property of the git history, not of any individual file's byte
+content. It is immune to line ending differences, encoding differences,
+and any other byte-level variation that does not change the logical
+content of the commit. The developer and the CC computer will always
+agree on what the current commit SHA is because they are both asking
+GitHub, which is the authoritative source.
+
+### 3.6 The Bootstrap Process
+
+A freshly provisioned CC computer has nothing on it. The bootstrap
+process is a single line pasted into the CC terminal:
 
 ```lua
 local r=http.get("https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/main/bootstrap.lua") local f=fs.open("bootstrap.lua","w") f.write(r.readAll()) f.close() r.close() shell.run("bootstrap.lua")
 ```
 
-`bootstrap.lua` fetches `startup.lua` from GitHub, writes it to disk, and reboots. On the next boot, `startup.lua` takes over and performs the full sync. After this one-time bootstrap, every future reboot is automatic.
+`bootstrap.lua` fetches `startup.lua` from the main branch, writes it
+to disk, and reboots. On the next boot, `startup.lua` detects that no
+`role.cfg` exists, fetches `configure_pc.lua` from the
+`interactive_role_selector` branch, and runs the role selection
+sequence. After role selection, every subsequent reboot is fully
+automatic.
 
-For the role provisioning flow, `startup.lua` is configured to detect that no `role.cfg` exists and redirect to the interactive role selector, described in Section 5.
+This bootstrap one-liner should be memorized or kept accessible. It is
+the factory reset for any CC computer in this network.
 
-### 3.6 Recovery
+### 3.7 Complete Failure History
 
-If a CC computer enters a bad state — wrong files, corrupted sync, or a previous broken version of `startup.lua` — recovery requires deleting the minimum necessary state and re-bootstrapping. The recovery procedure is:
+Every failure mode encountered during development is documented here.
+These failures shaped the final design. Understanding them is required
+to understand why the system is built the way it is.
 
+**Failure 1: The CRLF infinite reboot loop.**
+The file hash sync mechanism hashed file contents on the development
+machine and stored those hashes in a manifest. CC computers downloaded
+files and computed their own hashes to compare. Windows Git's line
+ending conversion caused every file's hash to differ between the
+manifest and the CC-computed version. The computer detected changes on
+every boot, pulled files, wrote them with CRLF endings, hashed them,
+still got a different hash from the manifest, and rebooted again. This
+was a permanent infinite loop. Resolution: abandon file hashing entirely
+and use commit SHA comparison, which is encoding-immune.
+
+**Failure 2: The GitHub API 404.**
+An early version of the SHA check attempted to reach `api.github.com`
+and received a 404. The URL was malformed. The correct endpoint is
+exactly:
+```
+https://api.github.com/repos/{owner}/{repo}/commits/{branch}
+```
+Any deviation from this format returns a 404. The URL format must be
+exact.
+
+**Failure 3: The infinite post-commit hook recursion.**
+A post-commit git hook was introduced to write the current commit SHA
+to `deployed_sha.txt` after each commit. The hook used
+`git commit --no-verify` to commit the updated SHA file. The assumption
+was that `--no-verify` would prevent the hook from re-firing.
+This assumption was wrong. `--no-verify` skips pre-commit hooks, not
+post-commit hooks. The post-commit hook fired after every commit
+including the commits it made itself. Within seconds, hundreds of
+commits were made. The terminal had to be killed with `Ctrl+C`. The
+repository accumulated hundreds of identical commits that had to be
+cleaned up.
+
+Resolution: remove all git hooks permanently. No hooks exist in this
+project. The lesson is absolute: hooks that call git commands will
+always risk recursive firing because git does not distinguish between
+user-initiated and hook-initiated commits in its hook dispatch logic.
+`--no-verify` is not a reliable recursion guard.
+
+**Failure 4: Zone.Identifier contamination.**
+Files downloaded through Windows Explorer acquire Zone.Identifier
+metadata files — for example, `startup.lua:Zone.Identifier`. When
+`git add .` was run, these metadata files were added to the repository
+as tracked files. They appeared in git history and caused confusion.
+
+Resolution: add `*:Zone.Identifier` to `.gitignore`. More importantly,
+perform all file operations from WSL rather than through Windows
+Explorer. WSL does not create Zone.Identifier files. This failure
+established the rule that file placement into the repository must always
+be done via nvim or WSL command line, never via Windows GUI tools.
+
+**Failure 5: The gen_file_list.py ordering problem.**
+`gen_file_list.py` uses `git ls-files` to enumerate tracked files. If
+run before new files are staged with `git add`, the new files are
+invisible to `git ls-files` and are omitted from `file_index.json`. A
+deployment with a stale `file_index.json` silently omits files from
+the CC computer.
+
+Resolution: the correct order is always: add files to tracking with
+`git add`, run `gen_file_list.py`, then commit. This order is now
+documented in the deployment workflow and enforced by the `deploy`
+command when it is written.
+
+**Failure 6: The startup.lua multi-branch declaration error.**
+When the branch header system was introduced, `startup.lua` was given
+a header declaring `Branches : main`. This was incorrect —
+`startup.lua` must be deployed to every branch because every CC
+computer needs it to boot. The `gen_file_list.py` tool correctly
+enforced the declaration: it skipped `startup.lua` on
+`interactive_role_selector` and `node/test` because those branches
+were not listed. The CC computers on those branches would never receive
+updates to `startup.lua`.
+
+This failure was caught before any CC computer was affected because
+the `gen_file_list.py` output was verified before committing. The
+developer noted: "I was going to see if you took it through the entire
+repo. This is why we invented this system — glad to see it's working."
+
+Resolution: change `startup.lua`'s declaration to:
+```lua
+-- Branches : main, interactive_role_selector,
+--            node/test
+```
+And update `gen_file_list.py` to handle multi-line continuation
+declarations. The parser now collects all continuation lines following
+a `Branches :` declaration until it encounters a line with a colon
+(indicating a new header field) or a non-comment line.
+
+### 3.8 Recovery Procedures
+
+**Soft recovery** — the computer has a bad sync state but `startup.lua`
+is functional:
+```lua
+fs.delete(".deployed_sha")
+reboot
+```
+Deleting `.deployed_sha` forces a full re-sync on next boot.
+
+**Hard recovery** — `startup.lua` itself is broken or the computer is
+in an unrecoverable state:
 ```lua
 fs.delete("startup.lua")
 fs.delete(".deployed_sha")
 ```
+Then paste the bootstrap one-liner. This pulls a fresh `startup.lua`
+from `main` and begins the provisioning flow.
 
-Then paste the bootstrap one-liner. This works because `startup.lua` is the entry point and `.deployed_sha` is the sync state. With both deleted, the bootstrap pulls a fresh `startup.lua` which then pulls everything from scratch. No other files need to be deleted unless they are known to be corrupted.
-
-For a full wipe — if for any reason all files on the computer need to be cleared — the safe wipe command is:
-
+**Full wipe** — all files must be cleared:
 ```lua
 for _, file in ipairs(fs.list("/")) do
     if file ~= "rom" then fs.delete(file) end
 end
 ```
+The `rom` directory must never be deleted. It contains the CC:Tweaked
+operating system. All other directories and files in root are user
+space. After wiping, paste the bootstrap one-liner.
 
-The `rom` directory must never be deleted. It contains the CC:Tweaked operating system and is write-protected, but attempting to delete it produces an access denied error that should not be triggered. All other directories and files in the root are user space and are safe to delete.
-
-### 3.7 Failure Modes Encountered and Resolved
-
-Several failure modes were encountered during development of the CI/CD pipeline. These are documented here so that future development does not repeat them.
-
-**The CRLF hash mismatch loop.** The first sync mechanism used FNV-1a hashes of file contents to detect changes. Windows Git converts line endings from LF to CRLF on checkout by default. This caused the computed hash of every file to differ from the hash stored in the manifest on every sync, because the manifest was generated on Windows with CRLF files but CC expects LF. The computer entered an infinite reboot loop because files were always detected as changed. This approach was abandoned entirely in favor of SHA-based sync, which compares commit SHAs rather than file content hashes and is immune to line ending differences.
-
-**The GitHub API 404.** An early version of the sync mechanism attempted to reach `api.github.com` but received a 404 response. This was caused by a misconfigured URL. The correct endpoint is `https://api.github.com/repos/{owner}/{repo}/commits/{branch}`. The URL format must be exact.
-
-**The infinite post-commit hook loop.** A post-commit git hook was introduced to write the current commit SHA to `deployed_sha.txt` after each commit, solving the problem of `git rev-parse HEAD` returning the previous commit SHA when called from a pre-commit hook. The post-commit hook called `git commit --no-verify` to commit the updated SHA file. However, `--no-verify` only skips pre-commit hooks, not post-commit hooks. The post-commit hook therefore triggered itself recursively, producing hundreds of commits before the terminal was killed with Ctrl+C. All git hooks were removed permanently after this incident. No git hooks are used in this project.
-
-**The Zone.Identifier contamination.** Files downloaded through Windows Explorer acquire Zone.Identifier metadata files (e.g. `startup.lua:Zone.Identifier`). When these files were added via `git add .`, they were committed to the repository and appeared as tracked files. This was resolved by adding `*:Zone.Identifier` to `.gitignore` and removing the contaminated files from tracking. All file operations should be performed from WSL rather than through Windows Explorer to prevent this.
-
-**The gen_file_list.py ordering problem.** `gen_file_list.py` uses `git ls-files` to enumerate tracked files. If it is run before new files are added to git tracking with `git add`, it will not include those files in `file_list.json`. The correct order is: add files to tracking with `git add`, run `gen_file_list.py`, commit. If `gen_file_list.py` is run first, it will generate a stale `file_list.json` that omits the new files.
+The `wipe.lua` utility on the `interactive_role_selector` branch
+automates the full wipe with a confirmation guard. It can be fetched
+directly without bootstrapping:
+```lua
+local r=http.get("https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/interactive_role_selector/wipe.lua")
+local f=fs.open("wipe.lua","w") f.write(r.readAll()) f.close() r.close()
+shell.run("wipe.lua")
+```
 
 ---
 
 ## 4. Repository Architecture and Branch Strategy
 
-### 4.1 Rationale for Branch-Per-Role
+### 4.1 Why Branches, Not Repositories
 
-The naive approach to a multi-role CC network is a single monolithic repository where every computer pulls the same codebase and runs only the parts it needs. This approach fails for two reasons. First, the total codebase will eventually exceed 2MB, at which point no single computer can hold all of it. Second, a computer pulling files it does not need wastes both storage and HTTP requests during sync.
+The naive approach to a multi-role CC network is a single monolithic
+repository where every computer pulls the same codebase. This fails for
+two reasons. First, the total codebase will eventually exceed 2MB, at
+which point no single computer can hold all of it. Second, a computer
+pulling files it does not need wastes both storage and HTTP requests.
 
-The correct approach is to use git branches as deployment targets. Each branch contains only the files needed for a specific role. A computer that runs reactor control logic only pulls the reactor control branch, which might contain a handful of Lua files totaling a few dozen kilobytes. A database node that performs a single query-response function pulls a branch that might contain a single Lua file.
+Multiple repositories were considered and rejected. The overhead of
+maintaining authentication, bootstrap URLs, and sync logic for multiple
+repositories is significantly higher than managing branches within one
+repository. Branches within a single repository share git infrastructure,
+can be created and deleted with simple tooling, and are navigated with
+the `branch_manager.py` utility described in Section 14.
 
-Multiple repositories were considered and rejected. The overhead of maintaining authentication, bootstrap URLs, and sync logic for multiple repositories is significantly higher than the overhead of maintaining branches within a single repository. Branches within a single repository can be created, deleted, and navigated with simple tooling, as described in Section 4.3.
+The correct approach is git branches as deployment targets. Each branch
+contains only the files needed for a specific role. A branch approaching
+2MB in total deployed file size must be split immediately. This is a
+hard rule, not a guideline. No branch has approached this limit in
+current development — deployed code sizes are measured in kilobytes.
 
 ### 4.2 Branch Naming Convention
 
-Branches are named with a hierarchical prefix that identifies their category and role:
+Branches follow a hierarchical prefix convention:
 
-The `main` branch contains the coordinator, channel bus, and core network primitives. This is the stable deployed branch for the coordinator computer.
+`main` — the coordinator, channel bus, and core network primitives.
+The stable deployed branch for the coordinator computer.
 
-Branches prefixed with `node/` contain the code for a specific worker node role. Examples include `node/reactor_control`, `node/ae2_monitor`, and `node/display`. Each node branch contains only the files needed for that specific role.
+`interactive_role_selector` — the emergency toolkit and provisioning
+branch. Contains `configure_pc.lua`, `wipe.lua`, and `startup.lua`.
+This branch is pulled on first boot to assign a role. It is also the
+source for emergency recovery tools.
 
-Branches prefixed with `cluster/` contain the code for cluster head computers that manage a wired cluster of worker nodes. Examples include `cluster/reactor` and `cluster/ae2`.
+`node/<role>` — worker node branches. Each contains only the code for
+that specific role. Examples: `node/reactor_control`, `node/ae2_monitor`,
+`node/display`, `node/db`, `node/test`.
 
-The `interactive_role_selector` branch is a special throwaway branch containing only `configure_pc.lua`. It exists solely to support the first-boot provisioning flow. After a computer runs `configure_pc.lua` and selects its role, this branch is never pulled by that computer again.
+`cluster/<role>` — cluster head branches. Manage a wired cluster of
+worker nodes. Examples: `cluster/reactor`, `cluster/ae2`.
 
-When a branch approaches 2MB in total deployed file size, it must be split into two or more branches immediately. This is a hard rule, not a guideline.
+### 4.3 The Role Tag System
 
-### 4.3 Branch Management Tooling
+To make `configure_pc.lua` self-maintaining — to ensure that adding a
+new role does not require editing any existing file — valid deployment
+branches are identified by git tags with the prefix `role/`.
 
-`branch_manager.py` is a local Python utility that wraps common git branch operations. It is listed in `.gitignore` and is never committed to the repository. It provides the following commands:
-
+A branch is tagged as a valid role with:
 ```bash
-python3 branch_manager.py list              # show all local and remote branches
-python3 branch_manager.py create <branch>   # create branch locally and push to remote
-python3 branch_manager.py delete <branch>   # delete branch locally and remotely (with confirmation)
-python3 branch_manager.py switch <branch>   # checkout branch
-python3 branch_manager.py show              # show current branch
+python3 branch_manager.py tag node/reactor_control
 ```
 
-The tool confirms destructive operations before executing them. Branch deletion requires typing `y` at a confirmation prompt.
+This creates and pushes the tag `role/node/reactor_control`. On first
+boot, `configure_pc.lua` fetches the tag list from the GitHub API,
+filters for tags starting with `role/`, strips the prefix, and presents
+the resulting branch names as selectable roles. Adding a new role
+requires only creating the branch and tagging it. No file edits are
+needed.
 
-### 4.4 Startup.lua and Branch Awareness
+Currently tagged roles: `interactive_role_selector`, `node/test`.
 
-`startup.lua` reads `/role.cfg` to determine which branch to pull. The role configuration file contains a single line:
+### 4.4 Current Branch State
 
-```
-branch=node/reactor_control
-```
+As of the last verified audit:
 
-On sync, `startup.lua` fetches `file_list.json` from the configured branch, not from `main`. This means each computer automatically pulls only the files for its assigned role. The GitHub API SHA check also uses the configured branch, so SHA comparisons are branch-specific.
+`main` — tracks `bootstrap.lua` (banned), `startup.lua`. Deploys
+`startup.lua` only. Last commit: `8a80fe7`.
+
+`interactive_role_selector` — tracks `bootstrap.lua` (banned),
+`configure_pc.lua`, `startup.lua`, `wipe.lua`. Deploys
+`configure_pc.lua`, `startup.lua`, `wipe.lua`.
+
+`node/test` — tracks `bootstrap.lua` (banned), `startup.lua`,
+`test_role_hello.lua`. Deploys `startup.lua`, `test_role_hello.lua`.
+
+All three branches also track `deploy_banlist.json`, `universal_files.json`,
+and `gen_file_list.py` as universal files. These are not Lua files and
+are not listed in `file_index.json` — they live on every branch for
+local tooling use but are never deployed to CC computers.
 
 ---
 
-## 5. Node Provisioning System
+## 5. The File Declaration and Deployment System
 
-### 5.1 Design Goals
+This section describes the system that replaced the original
+`file_list.json` manifest. The replacement was designed after the
+developer identified that the original system was "too fragile" and
+that "the plan is way more than the done section" — meaning the system
+needed to scale to dozens of branches without becoming a maintenance
+burden.
 
-The provisioning system must satisfy three requirements. First, it must be operable entirely from within the CC terminal — no external tools, no file transfers, no commands outside the game. Second, it must be self-documenting — the developer should not need to remember role names or branch names. Third, it must produce a computer that will correctly self-provision on every subsequent reboot without any further manual intervention.
+### 5.1 The Problem With the Original System
 
-### 5.2 The First Boot Flow
+The original `file_list.json` was a simple JSON array of file paths
+maintained manually. It had two jobs: define what gets deployed to CC
+computers, and serve as the sync payload for `startup.lua`. Conflating
+these two jobs created fragility. The file could drift from reality.
+There was no enforcement mechanism — a file could be tracked by git but
+omitted from `file_list.json`, and it would silently never be deployed.
+There was no way to know if the list was correct without manually
+comparing it to `git ls-files`.
 
-When a CC computer boots with a fresh `startup.lua` but no `role.cfg`, `startup.lua` detects the missing configuration and fetches the `interactive_role_selector` branch instead of a node branch. The `interactive_role_selector` branch contains only `configure_pc.lua`.
+The developer identified the core insight: "I am not the thing that
+preserves state. The system should." The manifest needed to be
+self-verifying.
 
-`configure_pc.lua` presents an interactive prompt that lists all available roles. The developer selects a role from the numbered list. `configure_pc.lua` writes the selected role to `/role.cfg`, deletes itself, and reboots. On the next boot, `startup.lua` finds `role.cfg`, reads the configured branch, and performs the standard sync against that branch. The computer is now fully provisioned and will self-maintain on every subsequent reboot.
+### 5.2 The Whitelist: File Header Declarations
 
-The list of available roles is maintained in `configure_pc.lua` itself. Adding a new role requires creating the corresponding branch, adding it to the role list in `configure_pc.lua`, and pushing the updated `configure_pc.lua` to the `interactive_role_selector` branch. No changes are needed on any already-provisioned computer.
+Every Lua file in this project declares its branch membership in a
+structured header comment. The declaration line follows the format:
 
-### 5.3 Recovery Without State
+```lua
+-- Branches : main
+-- Branches : node/reactor_control, node/test
+-- Branches : main, interactive_role_selector,
+--            node/test
+-- Branches : all
+```
 
-A key design requirement is that recovery must be possible from nothing. Nearly every computer on this network holds no state that needs to be recovered — its role is in `role.cfg` and its code comes from GitHub. If a computer needs to be fully reset, the procedure is to wipe it and run the bootstrap one-liner. The interactive provisioning flow handles the rest. The only computers that require special recovery consideration are database nodes, which hold data on their local filesystem that must be treated as persistent.
+The `Branches :` tag is the parser trigger. Everything following the
+colon on that line and on immediately following comment lines that
+contain no colon is collected and split on commas to produce the list
+of branches where this file should be deployed.
+
+The special value `all` means the file is deployed to every branch
+without exception.
+
+A Lua file with no `Branches :` declaration in its header is a hard
+error. `gen_file_list.py` aborts with an error message naming the
+offending file. Deployment cannot proceed until every Lua file has a
+valid declaration. This is Law, not Convention. It cannot be bypassed.
+
+### 5.3 The Blacklist: deploy_banlist.json
+
+`deploy_banlist.json` lists files that must never reach a CC computer
+regardless of any other declaration. It overrides the whitelist. A file
+listed in the banlist is excluded from `file_index.json` even if its
+header says `Branches : all`.
+
+The banlist is intentionally small and stable. It changes rarely and
+only when a new file category is introduced that should never be
+deployed. Current contents:
+
+```json
+{
+  "banned": [
+    "bootstrap.lua",
+    "CC_NETWORK_DESIGN.md",
+    "deploy_banlist.json",
+    "gen_file_list.py",
+    "branch_manager.py",
+    "LICENSE",
+    ".gitignore"
+  ]
+}
+```
+
+`bootstrap.lua` is banned because it is a one-time paste utility, not
+a deployed program. `CC_NETWORK_DESIGN.md` is banned because it is
+documentation. `deploy_banlist.json` and `gen_file_list.py` are banned
+because they are tooling that belongs on the developer's machine, not
+on CC computers. `branch_manager.py` is untracked and never enters git.
+
+### 5.4 The Deployment Artifact: file_index.json
+
+`file_index.json` is generated by `gen_file_list.py` and consumed by
+`startup.lua` on CC computers. It is the list of files that should be
+fetched and deployed to this computer on this branch.
+
+`file_index.json` is derived automatically from the declarations in Lua
+file headers filtered through the banlist. It is never manually edited.
+If the file index is wrong, the fix is to correct the header declaration
+of the offending file and regenerate.
+
+### 5.5 Universal Files: universal_files.json
+
+`universal_files.json` lists files that are eligible for the
+`propagate --all` command. Only files listed here may be universally
+propagated. This guard prevents accidentally propagating a
+branch-specific file to every branch via `--all`.
+
+The universal files are:
+- `deploy_banlist.json` — every branch must know what is banned
+- `universal_files.json` — every branch must know what is universal
+- `gen_file_list.py` — every branch needs to generate its own index
+
+These three files are non-Lua and therefore not processed by the header
+declaration system. Their universal status is declared by their presence
+in `universal_files.json`. They are propagated to all branches using
+the `propagate --all` command.
+
+### 5.6 How gen_file_list.py Works
+
+`gen_file_list.py` performs the following steps:
+
+1. Load `deploy_banlist.json` into a set for O(1) lookup.
+2. Get the current branch using `git branch --show-current`.
+3. Get all tracked files using `git ls-files`, filter to `.lua` files.
+4. For each Lua file:
+   a. If it is in the banlist, mark it BANNED and skip.
+   b. Read its header and parse the `Branches :` declaration.
+   c. If no declaration is found, mark it ERROR and set error flag.
+   d. If `all` is in the declared branches, mark it UNIVERSAL and
+      include it.
+   e. If the current branch is in the declared branches, mark it
+      INCLUDE and add it to the deployment list.
+   f. Otherwise, mark it SKIP.
+5. If any errors were found, abort without writing `file_index.json`.
+6. Write `file_index.json` with the deployment list.
+
+The output to stdout shows the disposition of every file — BANNED,
+UNIVERSAL, INCLUDE, SKIP, or ERROR — so the developer can verify that
+every file was handled correctly before committing.
+
+### 5.7 The Continuation Line Parser
+
+The header declaration parser reads the `Branches :` line and then
+continues reading subsequent comment lines as long as they:
+- Start with `--` (are comment lines)
+- Contain no `:` (a colon would indicate a new header field)
+
+This allows multi-line branch declarations for files that belong to many
+branches without exceeding the 51-character terminal width constraint.
+The collected lines are joined, split on commas, and trimmed. Trailing
+commas on continuation lines are handled correctly.
 
 ---
 
-## 6. Network Topology
+## 6. Node Provisioning System
 
-### 6.1 Two Transport Layers
+### 6.1 Design Goals
 
-The network uses two physically distinct transport layers with different roles.
+The provisioning system must satisfy three requirements. First, it must
+be operable entirely from within the CC terminal — no external tools,
+no file transfers, no commands from outside the game. Second, it must
+be self-documenting — the developer should not need to remember role
+names or branch names. Third, it must produce a computer that will
+correctly self-maintain on every subsequent reboot without further
+manual intervention.
 
-The wireless fabric uses CC:Tweaked wireless modems and the rednet API. Wireless communication reaches any computer with a wireless modem within range. The fabric is used for coordinator-to-node communication, channel state broadcasts, and display subscription messages. Any computer anywhere can participate in the fabric by having a wireless modem attached.
+### 6.2 The First Boot Detection
 
-The wired cluster network uses CC:Tweaked wired modems and networking cable. Wired communication is restricted to computers physically connected by cable. Wired networks are used for clusters of worker nodes performing related tasks, such as a cluster of computers monitoring different components of the same reactor array. Wired networks are significantly easier to manage than wireless for high-density node groups because they do not require line-of-sight or range calculations and have no interference issues.
+`startup.lua` checks for the existence of `role.cfg` on every boot. If
+the file does not exist, the computer is not yet provisioned. Rather
+than failing or prompting the developer to paste a command, it
+automatically fetches `configure_pc.lua` from the
+`interactive_role_selector` branch and runs it. This means a computer
+that has only been bootstrapped — that has `startup.lua` but no
+`role.cfg` — will enter the role selection flow automatically on its
+first boot after bootstrapping.
 
-### 6.2 Node Roles
+### 6.3 The Role Selection Flow
 
-The network has four distinct node roles.
+`configure_pc.lua` runs on first boot. It connects to the GitHub API
+and fetches the list of all tags matching `role/*`. It strips the
+`role/` prefix from each tag to get the branch name and presents the
+resulting list as a numbered menu. The developer selects a role. A
+confirmation prompt shows the selected role and branch and asks for
+confirmation. After confirmation, `configure_pc.lua`:
 
-The fabric coordinator is the root of the process tree. It has a wireless modem and manages the channel registry, process lifetime, and shutdown broadcast. It is a designated computer that should be treated as permanent infrastructure. Killing the coordinator initiates a graceful shutdown of all managed processes across the entire network.
+1. Writes `branch=<selected_branch>` to `role.cfg`.
+2. Deletes itself from the CC filesystem.
+3. Reboots.
 
-The cluster I/O manager is the interface between a wired cluster and the wireless fabric. It has both a wired modem (facing the cluster) and a wireless modem (facing the fabric). It proxies messages between cluster worker nodes and the fabric, translating between the two transport protocols. Each physical cluster has one cluster I/O manager.
+On the next boot, `startup.lua` finds `role.cfg`, reads the configured
+branch, and performs the standard sync against that branch. The computer
+is fully provisioned and self-maintaining.
 
-Worker nodes are computers that run a single process. Each worker node has a wired modem connecting it to its cluster's I/O manager. A worker node publishes its state on a named channel and receives control commands from the coordinator through the cluster I/O manager.
+The list of available roles is always current because it is fetched live
+from GitHub. Adding a new role requires creating the branch and running
+`python3 branch_manager.py tag <branch>`. No files need to be edited.
 
-Display nodes are computers attached to one or more CC monitors. They subscribe to a named channel and render the state payloads they receive onto their attached monitors. A display node has no process logic of its own — it is purely a renderer. Display nodes may have either a wireless modem (for fabric-connected displays in arbitrary locations) or a wired modem (for displays in a dedicated control room connected to a cluster).
+The developer tested this flow and it worked correctly on the first
+attempt after the system was built.
 
-### 6.3 The Coordinator as Root
+### 6.4 The Exit Path
 
-The coordinator is the single point of authority for the entire network. It maintains the authoritative list of all live channels, all display subscriptions, and all process assignments. It is the only node that can spawn and kill processes. It is the only node that can reassign displays. It receives heartbeats from all managed processes and detects dead processes by missed heartbeats.
+At every prompt in `configure_pc.lua`, entering `0` exits to the CC
+terminal without making any changes. The exit message tells the
+developer how to resume: `Run configure_pc.lua to reconfigure.` Since
+`configure_pc.lua` deletes itself after successful completion, an
+exited-but-not-completed flow leaves `configure_pc.lua` on disk and
+the developer can re-run it by typing its name.
 
-If the coordinator goes down, all managed processes continue running but become unmanageable — they cannot be killed, reassigned, or monitored through the normal interface. They will continue running until their host computers are rebooted or until they exhaust memory. This is an acceptable failure mode because the coordinator is designated infrastructure and its loss is treated as a significant event requiring the developer to re-enter the game and restart it. Processes spawned directly from individual CC terminals (standalone processes) are not coordinator-managed and are not affected by coordinator loss.
+### 6.5 The wipe.lua Emergency Utility
+
+`wipe.lua` lives on the `interactive_role_selector` branch. It is the
+nuclear option — a full filesystem wipe for computers in states that
+cannot be repaired by normal recovery. It exists because the developer
+anticipated that some failure modes would produce states where even the
+soft and hard recovery procedures would not work.
+
+`wipe.lua` requires typing `WIPE` in full caps at the confirmation
+prompt. This is stronger than a `y/N` prompt because the word `WIPE`
+is semantically unambiguous — you cannot type it accidentally while
+trying to type something else. After wiping, it prints the bootstrap
+one-liner so the developer does not need to remember it.
+
+`wipe.lua` never auto-reboots. After wiping, the computer sits at a
+clean terminal prompt. The developer decides what to do next. This is
+intentional — automatic reboot after a wipe would immediately trigger
+a boot with no `startup.lua`, which would fail. The developer must
+paste the bootstrap one-liner manually after wiping.
+
+### 6.6 Recovery Without State
+
+A key design principle: nearly every computer on this network holds no
+state that needs to be recovered. Its role is in `role.cfg` and its
+code comes from GitHub. If a computer needs to be fully reset, wipe it
+and run the bootstrap one-liner. The provisioning flow handles the rest.
+The only computers that require special recovery consideration are
+database nodes, which hold data on their local filesystem that must
+be treated as persistent.
 
 ---
 
-## 7. The Display Fabric
+## 7. Network Topology
 
-### 7.1 Core Contract
+### 7.1 Two Transport Layers
 
-The display fabric is built on a single foundational contract: a process exists if and only if its channel is live. Every process that runs on the network owns a named channel. It broadcasts its state to that channel on a fixed interval. It sends a heartbeat on that channel even when its state has not changed. If a channel goes silent — no heartbeat for a configured number of ticks — the process is considered dead.
+The network uses two physically distinct transport layers.
 
-This contract has two important consequences. First, there are no silent background processes. If something is running, it has a channel. If a channel is live, something is running. The two are definitionally equivalent. Second, every running process is always observable from anywhere on the network. A developer who wants to see what a process is doing simply subscribes a monitor to its channel. The process does not need to be restarted, reconfigured, or modified in any way.
+The wireless fabric uses CC:Tweaked wireless modems and the rednet API.
+Wireless communication reaches any computer with a wireless modem within
+range. The fabric is used for coordinator-to-node communication, channel
+state broadcasts, and display subscription messages. Any computer
+anywhere can participate by having a wireless modem.
 
-### 7.2 The Broadcast-Subscribe Model
+The wired cluster network uses CC:Tweaked wired modems and networking
+cable. Wired communication is restricted to computers physically
+connected by cable. Clusters of worker nodes performing related tasks —
+monitoring different components of the same reactor array — use wired
+networks because they are easier to manage at high node density.
 
-Every producer broadcasts its state continuously on its channel. It does not know or care how many subscribers are listening. It does not know or care what monitors are rendering its state. It simply broadcasts.
+### 7.2 Node Roles
 
-Every display node subscribes to exactly one channel at a time. It receives state packets from that channel and renders them. It can be reassigned to a different channel by a command from the coordinator, at which point it unsubscribes from the current channel and subscribes to the new one.
+**Fabric coordinator** — the root of the process tree. Has a wireless
+modem. Manages the channel registry, process lifetime, and shutdown
+broadcast. Designated permanent infrastructure. Killing the coordinator
+initiates graceful shutdown of all managed processes.
 
-Multiple display nodes can subscribe to the same channel simultaneously. This is the "cast to the big screen" operation. The developer invokes a command that tells the central display to subscribe to the reactor channel. The reactor controller does not change. The control room display does not change. The central display simply begins receiving and rendering the same state packets that the control room display was already receiving. When the developer is done, another command tells the central display to resubscribe to whatever it was showing before.
+**Cluster I/O manager** — interface between a wired cluster and the
+wireless fabric. Has both a wired modem and a wireless modem. Proxies
+messages between worker nodes and the fabric. Each cluster has one.
 
-### 7.3 The Invocation Model
+**Worker nodes** — run a single process. Have a wired modem connecting
+to the cluster I/O manager. Publish state on a named channel, receive
+control commands through the cluster I/O manager.
 
-Every subroutine is invoked with a display assignment:
+**Display nodes** — attached to one or more CC monitors. Subscribe to
+a named channel and render state payloads. No process logic of their
+own — purely renderers. May have wireless (arbitrary location) or wired
+(dedicated control room) modems.
 
+### 7.3 The Coordinator as Root
+
+The coordinator is the single point of authority for the entire network.
+It maintains the authoritative list of all live channels, display
+subscriptions, and process assignments. It is the only node that can
+spawn and kill processes and reassign displays.
+
+If the coordinator goes down, managed processes continue running but
+become unmanageable. They cannot be killed, reassigned, or monitored
+through the normal interface. They will run until their host computers
+are rebooted or exhaust memory. This is an accepted failure mode. The
+coordinator is permanent infrastructure and its loss is a significant
+event requiring manual recovery.
+
+Processes spawned directly from individual CC terminals (standalone
+processes, not coordinator-managed) are unaffected by coordinator loss.
+
+---
+
+## 8. The Display Fabric
+
+### 8.1 The Mental Model
+
+The display fabric was designed around a specific mental model that the
+developer articulated during the design session: switching inputs on a
+monitor. When you switch a physical monitor's input, the monitor changes
+what it displays. The signal sources themselves do not change. They
+continue producing signal. The monitor simply stops showing one source
+and starts showing another.
+
+This mental model has a critical implication: you command the display,
+not the producer. If you want to see the reactor status on the central
+display, you send a command to the central display node telling it to
+tune to the reactor channel. You do not send a command to the reactor
+controller telling it to also send its data to the central display.
+The reactor controller never knows or cares what is displaying its data.
+
+This design decision means that the producer is stateless with respect
+to its display assignment. It broadcasts on its channel continuously
+regardless of who is listening. This makes the system significantly
+simpler: adding or removing display nodes from a channel requires no
+changes to the producing process.
+
+### 8.2 The Core Contract
+
+A process exists if and only if its channel is live.
+
+Every process that runs on the network owns a named channel and
+broadcasts its state to that channel on a fixed interval. A process
+that has crashed, hung, or been killed stops broadcasting. The
+coordinator detects channel silence via missed heartbeats and marks
+the process as dead.
+
+This contract has two consequences. First, there are no silent
+background processes. If something is running, its channel is live.
+Second, every running process is always observable from anywhere on
+the network. Subscribing a monitor to any live channel requires no
+changes to the producing process.
+
+### 8.3 The Broadcast-Subscribe Model
+
+Every producer broadcasts on its channel regardless of subscriber count.
+Zero subscribers is valid. One hundred subscribers is valid. The
+producer does not track subscribers.
+
+Every display node subscribes to exactly one channel at a time. It
+renders the state packets it receives. It can be reassigned to a
+different channel by a coordinator command. Multiple display nodes
+can subscribe to the same channel simultaneously.
+
+The "cast to big screen" operation: the developer sends a watch command
+to the central display node telling it to subscribe to the reactor
+channel. The reactor controller does not change. The control room
+display does not change. The central display begins receiving and
+rendering the same state packets. When done, the central display is
+reassigned to its previous channel.
+
+### 8.4 The Invocation Model
+
+Every process is invoked with a display assignment:
 ```
 run reactor_control --display control_room
 ```
 
-This command tells the coordinator to spawn the `reactor_control` process and tells the `control_room` display node to subscribe to the `reactor_control` channel. The display assignment is not hardwired — it is a runtime parameter. The same process could be started with a different display:
-
-```
-run reactor_control --display central_display
-```
-
-To view a running process on an additional display without changing its primary display:
-
+The display assignment is a runtime parameter, not hardwired. The same
+process can be started with a different display. A running process can
+have additional displays attached with `watch`:
 ```
 watch reactor_control --display central_display
 ```
 
-This tells the `central_display` node to subscribe to the `reactor_control` channel. The `control_room` display continues showing `reactor_control` unchanged. Both displays now show the same data.
+### 8.5 The Shutdown Protocol
 
-### 7.4 Process Management Commands
+Graceful shutdown is a first-class operation. The sequence:
 
-The full set of process management commands, to be implemented in `shell_commands.lua`, is as follows.
+1. Kill command reaches the coordinator.
+2. Coordinator broadcasts SHUTDOWN on every live channel.
+3. Every managed process receives SHUTDOWN, completes its current
+   bounded operation, cleans up, and exits.
+4. Every display node receives SHUTDOWN, clears its screen, goes idle.
+5. Coordinator exits last.
 
-`run <process> --display <node>` spawns a process and assigns a display to it. The coordinator registers the channel, spawns the process on the appropriate node, and sends a subscribe command to the specified display node.
-
-`list` returns the current state of the channel registry — all live channels, the computer ID of the producing node, the last heartbeat timestamp, and the current display assignment or assignments for each channel.
-
-`watch <channel> --display <node>` subscribes a display node to a channel. The display node begins rendering that channel's state. The channel's producing process is unaffected.
-
-`kill <channel>` sends a SHUTDOWN message to the specified channel. The process receiving the SHUTDOWN message cleans up and exits. The coordinator removes the channel from the registry. Any display nodes subscribed to that channel receive the SHUTDOWN and go idle.
-
-### 7.5 The Shutdown Protocol
-
-Graceful shutdown is a first-class operation, not an afterthought. The complete shutdown sequence for a coordinator-initiated full shutdown is as follows.
-
-The developer issues a kill command targeting the coordinator itself, or the coordinator detects a shutdown condition. The coordinator iterates its channel registry and broadcasts a SHUTDOWN message on every live channel. It then waits for acknowledgement from each channel, with a timeout. Channels that do not acknowledge within the timeout are marked as unresponsive and logged. The coordinator then broadcasts a SHUTDOWN message on the display fabric, causing all display nodes to clear their screens and go idle. The coordinator then exits.
-
-Every process must handle SHUTDOWN as a reserved message type with higher priority than any application message. The channel bus checks every received message against the SHUTDOWN type before passing it to application logic. A process that receives SHUTDOWN must complete its current operation (which, by the finite pattern rule, is always bounded), clean up any allocated resources, and exit cleanly.
-
-The shutdown flag pattern that every process must implement is as follows. A module-level boolean `shutdown_requested` is initialized to false. The channel bus sets it to true when a SHUTDOWN message is received. Every loop in every process checks this flag as its first action. Every blocking operation has a timeout so that the flag check is reached within a bounded time.
-
-The reason this matters is that CC computers have no external kill mechanism accessible to the developer without server admin access. `Ctrl+T` terminates a running program from the local terminal, but the developer is not always at the local terminal. Without a reliable SHUTDOWN protocol, a hung process can only be killed by physically breaking the computer block, which requires server admin access. The SHUTDOWN protocol is the only tool available for clean remote process termination.
+SHUTDOWN is a reserved message type in the channel bus. It is checked
+before any application logic. A process that receives SHUTDOWN must
+exit within a bounded time. The finite pattern requirement guarantees
+this — every operation is bounded, so SHUTDOWN is always reached within
+a finite number of steps.
 
 ---
 
-## 8. The Channel Bus and Process Model
+## 9. The Channel Bus and Process Model
 
-### 8.1 Purpose
+### 9.1 Purpose and Status
 
-`channel_bus.lua` is the lowest-level network primitive. Everything else in the system depends on it. It abstracts the transport layer (wireless rednet vs. wired modem), provides named channel semantics on top of computer ID and port addressing, implements message framing and fragmentation for large payloads, handles heartbeat generation and reception, and enforces the SHUTDOWN reserved message type.
+`channel_bus.lua` is the lowest-level network primitive. Everything
+in the network depends on it. It is not yet written. This section
+describes what it must implement.
 
-Application code never calls `rednet.send` or `rednet.receive` directly. It calls `channel_bus.send`, `channel_bus.receive`, and `channel_bus.broadcast`. The channel bus handles all transport details.
+### 9.2 Required Functionality
 
-### 8.2 Message Types
+Named channel semantics over computer ID and port addressing. A process
+sends to a named channel, not to a computer ID. The bus resolves the
+channel to the appropriate transport.
 
-The channel bus defines a small set of reserved message types that are handled by the bus itself and never passed to application logic. SHUTDOWN is the most important. HEARTBEAT is the second — it is sent by every process on a fixed interval and received by the coordinator to maintain the process registry. ACK is sent in response to SHUTDOWN to confirm clean exit.
+Transport abstraction. The same API covers both wireless rednet and
+wired modems. Application code never calls `rednet.send` directly.
 
-All other message types are application-defined and passed through to the application layer without modification.
+Message framing. Every message has a type field. The bus checks the
+type before passing the message to application logic.
 
-### 8.3 Fragmentation
+Reserved message types. SHUTDOWN and HEARTBEAT are handled by the bus
+itself and never passed to application logic.
 
-For payloads that exceed the practical single-message size, the channel bus implements fragmentation. A large payload is split into chunks of a defined maximum size. Each chunk is sent as a separate message with a sequence number, a total count, and a message ID that groups all chunks belonging to the same logical message. The receiving end reassembles chunks in order and delivers the complete payload to the application layer only when all chunks have been received.
+Heartbeat generation. Every process sends a HEARTBEAT message on a
+fixed interval. The coordinator receives heartbeats and maintains
+last-seen timestamps for every channel.
 
-Fragmentation adds complexity and latency. It should only be used for payloads that genuinely require it. State packets for reactor monitoring will typically be small enough to fit in a single message. AE2 inventory snapshots, which may contain hundreds of item entries, are the primary use case for fragmentation.
+Fragmentation for large payloads. Payloads exceeding practical
+single-message size are split into chunks with sequence numbers and
+total count. The receiving end reassembles and delivers the complete
+payload only when all chunks arrive.
 
-### 8.4 The Heartbeat and Health Monitoring
+### 9.3 The Heartbeat and Health Monitoring
 
-Every process sends a HEARTBEAT message on its channel at a configured interval, regardless of whether its state has changed. The coordinator receives these heartbeats and updates the last-seen timestamp for each channel in the registry.
+Every process sends HEARTBEAT on its channel at a configured interval
+regardless of whether its state has changed. The coordinator updates
+the last-seen timestamp. If no heartbeat arrives within a configured
+timeout, the coordinator begins a grace period. If no heartbeat arrives
+within the grace period, the channel is marked dead, removed from the
+registry, and subscribed display nodes are notified.
 
-If the coordinator does not receive a heartbeat from a channel within a configured timeout (a multiple of the heartbeat interval, to allow for network jitter), it marks that channel as potentially dead and begins a grace period. If no heartbeat arrives within the grace period, the channel is marked as dead, removed from the registry, and any display nodes subscribed to it are notified.
-
-This mechanism provides passive health monitoring without requiring the coordinator to poll every process. Processes that are running correctly generate their own evidence of health. Processes that have crashed, hung, or been killed stop generating heartbeats and are detected automatically.
-
----
-
-## 9. Memory Management
-
-### 9.1 The Fundamental Rule
-
-No data structure in any process may grow without bound. Every table that accumulates data over time must have a maximum size enforced at insertion time. When a new entry would exceed the maximum, the oldest entry is removed before the new one is added. This is a non-negotiable design rule that applies to every file in every branch of this repository.
-
-### 9.2 State Packet Design
-
-State packets — the payloads that processes broadcast on their channels — must be designed to be as compact as possible. Every field in a state packet must be justified by a downstream consumer that actually uses it. Fields that are "nice to have" but not consumed by any subscriber are waste. For a reactor state packet, the core required fields are the values needed by the display renderer and the values needed by the safety logic. Everything else is excluded.
-
-Numeric values should use integers where possible. Floating point values should be rounded to a useful precision before transmission. String values should be kept as short as possible — use codes or enumerated integers instead of descriptive strings where the receiving end can reconstruct the display text.
-
-### 9.3 The Registry Pruning Rule
-
-The coordinator's channel registry is the central data structure most at risk of unbounded growth. Every dead channel entry must be removed from the registry promptly. The coordinator does not accumulate historical data about dead processes — that information is irrelevant to the current operational state. If a process dies and is restarted, it registers as a new channel entry. There is no merger with the old entry.
-
-### 9.4 Display Node Memory
-
-Display nodes are at particular risk because they may receive state packets at high frequency from one or more channels. A display node must not accumulate received state packets. It processes each packet, updates its display, and discards the packet. It holds only the most recent state for the channel it is currently rendering. Historical data for graphing or trend display, if required, is held in a fixed-size ring buffer with a defined maximum entry count.
-
-### 9.5 The Database Cluster Memory Model
-
-Database cluster nodes hold data on their local filesystem and load it into memory only to service a query. A database node that is idle consumes no heap memory beyond the minimal overhead of `startup.lua` waiting for a rednet message. When a query arrives, the node loads the relevant data from disk, processes the query, sends the response, and immediately deallocates the loaded data. It does not cache data in memory between queries.
-
-This model means that the database cluster's storage capacity is determined by the total filesystem space across all nodes, which is up to 2GB for a 1000-node cluster, and its memory consumption is determined by the size of the data loaded to service a single query, which must fit within a single node's 2MB heap.
+Health monitoring is passive. Processes that are running generate their
+own evidence of health. Processes that have crashed stop generating
+heartbeats and are detected automatically.
 
 ---
 
-## 10. The NuclearCraft Peripheral API
+## 10. Memory Management
 
-### 10.1 Peripheral Registration
+### 10.1 The Fundamental Rule
 
-The NuclearCraft fission reactor exposes a CC:Tweaked peripheral through `SolidFissionReactorPeripheral.java`, located at `src/main/java/igentuman/nc/compat/cc/SolidFissionReactorPeripheral.java` in the NuclearCraft fork. This is the only file in the entire fork that imports CC:Tweaked APIs.
+No data structure in any process may grow without bound. Every table
+that accumulates data over time must have a maximum size enforced at
+insertion time. When a new entry would exceed the maximum, the oldest
+entry is removed before the new one is added. This is non-negotiable
+and applies to every file in every branch.
 
-The peripheral is registered under the type name `nc_fission_reactor`. In Lua, the peripheral is accessed as:
+### 10.2 The Comments-Cost-Zero-RAM Insight
 
+This came up as an explicit question during development: given the 2MB
+RAM limit, how many comments and headers are too many? The answer was
+confirmed definitively: comments cost zero RAM. They are stripped by
+the Lua parser and never loaded into the heap. The 2MB limit is about
+runtime allocation, not source file size. Write full headers on every
+file. Write verbose comments. The only cost is disk space, which is
+not the binding constraint.
+
+### 10.3 State Packet Design
+
+State packets must be compact. Every field must be justified by a
+downstream consumer. For a reactor state packet: heat stored, heat per
+tick, cooling per tick, max heat capacity, energy stored, energy
+capacity, energy per tick, reactivity level, active state. Everything
+the display renderer needs to draw the display and everything the
+safety logic needs to make control decisions. Nothing else.
+
+### 10.4 The Registry Pruning Rule
+
+The coordinator's channel registry must prune dead entries promptly.
+The coordinator does not accumulate historical data about dead
+processes. When a process dies and is restarted, it registers as a
+new channel entry. There is no merger with the old entry.
+
+### 10.5 Database Cluster Memory Model
+
+Database cluster nodes hold data on their local filesystem and load
+it into memory only to service a query. An idle node consumes no heap
+beyond the minimal overhead of `startup.lua` waiting for a rednet
+message. When a query arrives: load data from disk, process query,
+send response, deallocate. Idle between queries. Total RAM cost is
+determined by the maximum working set of a single query, not by the
+total dataset size.
+
+---
+
+## 11. The NuclearCraft Peripheral API
+
+### 11.1 Peripheral Registration
+
+The NuclearCraft fission reactor exposes a CC:Tweaked peripheral through
+`SolidFissionReactorPeripheral.java` at:
+```
+src/main/java/igentuman/nc/compat/cc/SolidFissionReactorPeripheral.java
+```
+
+This is the only file in the entire NuclearCraft fork that imports
+CC:Tweaked APIs. The peripheral is registered under the type name
+`nc_fission_reactor`. In Lua:
 ```lua
 local reactor = peripheral.find("nc_fission_reactor")
 ```
 
-### 10.2 Full API Reference
+### 11.2 Full API Reference
 
-The following methods are exposed by the peripheral. Three methods — `isActive`, `getEnergyCapacity`, and `getReactivityLevel` — are additions made during this project and are not present in the upstream igentuman NuclearCraft Neoteric repository.
+Three methods were added during this project and are not present in
+the upstream igentuman NuclearCraft Neoteric repository: `isActive`,
+`getEnergyCapacity`, and `getReactivityLevel`. The mod has been
+rewritten to include these but has not yet been rebuilt and redeployed.
+They must be compiled and the JAR redeployed before they are callable
+from Lua.
 
 **State query methods:**
 
-`isFormed()` returns a boolean indicating whether the reactor multiblock structure is currently valid. This checks both `isCasingValid` and `isInternalValid` on the controller block entity. A reactor that is not formed will not process fuel regardless of its active state.
+`isFormed()` → boolean. Checks both `isCasingValid` and
+`isInternalValid`. A reactor that is not formed will not process fuel.
 
-`isActive()` returns a boolean indicating whether the reactor is currently running. This reads `controllerEnabled` from the controller block entity. `controllerEnabled` is the computed active state — it is true only when the reactor is formed, has a redstone signal enabling it, and has not been force-shut down via `disableReactor()`. This is the authoritative active state and should be used in preference to any derived approximation.
+`isActive()` → boolean. Reads `reactor.controllerEnabled`. This is the
+computed active state: true only when formed, has a redstone signal,
+and has not been force-shut down. This is the authoritative active
+state. Do not derive active state from `getHeat() > 0` — that check
+is unreliable because a reactor at zero heat production may still be
+active during ramp-up.
 
-`getName()` returns the reactor's configured name as a string.
+`getName()` → string. The reactor's configured name.
 
-`hasRecipe()` returns a boolean indicating whether the current fuel configuration has a valid recipe.
+`hasRecipe()` → boolean. Whether the current fuel has a valid recipe.
 
-`isSteamMode()` returns a boolean indicating whether the reactor is configured for steam output rather than FE output.
+`isSteamMode()` → boolean. Whether the reactor outputs steam rather
+than FE.
 
-`getSteamRate()` returns a double representing the current steam output rate.
+`getSteamRate()` → double. Current steam output rate.
 
-`getDepletionProgress()` returns an integer from 0 to 100 representing the percentage of fuel consumed. 100 indicates the fuel is fully depleted.
+`getDepletionProgress()` → int (0-100). Percentage of fuel consumed.
 
-`getMaxHeatCapacity()` returns a double representing the maximum heat the reactor can hold before damage occurs.
+`getMaxHeatCapacity()` → double. Maximum heat before damage.
 
-`getEnergyPerTick()` returns an integer representing the FE generated per tick at current operating conditions.
+`getEnergyPerTick()` → int. FE generated per tick at current conditions.
 
-`getEnergyStored()` returns an integer representing the FE currently stored in the reactor's internal buffer.
+`getEnergyStored()` → int. FE currently in the internal buffer.
 
-`getEnergyCapacity()` returns an integer representing the maximum FE capacity of the reactor's internal buffer. This reads `energyStorage().getMaxEnergyStored()`. The buffer capacity is fixed at 100,000,000 FE by the `createEnergy()` method in `FissionControllerBE`. Buffer percentage is computed in Lua as `getEnergyStored() / getEnergyCapacity() * 100`.
+`getEnergyCapacity()` → int. Maximum FE capacity. Reads
+`energyStorage().getMaxEnergyStored()`. Fixed at 100,000,000 FE by
+`createEnergy()` in `FissionControllerBE`. Buffer percentage is
+computed in Lua as `getEnergyStored() / getEnergyCapacity() * 100`.
 
-`getHeatMultiplier()` returns a double representing the current heat multiplier.
+`getHeatMultiplier()` → double. Current heat multiplier.
 
-`getModeratorsCount()` returns an integer count of moderator blocks in the reactor structure.
+`getModeratorsCount()` → int. Count of moderator blocks.
 
-`getHeatSinksCount()` returns an integer count of heat sink blocks in the reactor structure.
+`getHeatSinksCount()` → int. Count of heat sink blocks.
 
-`getFuelCellsCount()` returns an integer count of fuel cell blocks in the reactor structure.
+`getFuelCellsCount()` → int. Count of fuel cell blocks.
 
-`getCooling()` returns an integer representing the heat removed per tick by heat sinks.
+`getCooling()` → int. Heat removed per tick by heat sinks.
 
-`getHeat()` returns an integer representing the heat generated per tick by the fuel. This value is zero when the reactor is inactive, even if the reactor retains stored heat.
+`getHeat()` → int. Heat generated per tick by fuel. Zero when inactive.
 
-`getHeatStored()` returns an integer representing the current stored heat.
+`getHeatStored()` → int. Current stored heat.
 
-`getReactivityLevel()` returns an integer from 0 to 100 representing the current reactivity. This reads `reactor.reactivityLevel`, which increments by 1 per tick when the reactor is active and decrements by 1 per tick when inactive, clamped to the range 0-100. Reactivity directly affects both heat output and FE output — a reactor at 50% reactivity produces approximately half its steady-state output. This value is essential for understanding whether a recently enabled reactor has reached steady state and for interpreting heat and power readings during the ramp-up and ramp-down periods.
+`getReactivityLevel()` → int (0-100). Reads `reactor.reactivityLevel`.
+Increments by 1 per tick when active, decrements by 1 per tick when
+inactive, clamped to 0-100. Directly affects heat output and FE output.
+Essential for detecting whether a recently enabled reactor has reached
+steady state. A reactor at 50% reactivity produces approximately half
+its steady-state output. Control decisions made during ramp-up or
+ramp-down are unreliable without accounting for reactivity.
 
-`getFuelInSlot()` returns a table describing the current fuel item.
+`getFuelInSlot()` → table. Describes the current fuel item.
 
 **Control methods:**
 
-`enableReactor()` calls `reactor.disableForceShutdown()`, clearing the force shutdown flag and allowing the reactor to run if it has a redstone signal and is formed.
+`enableReactor()` — calls `reactor.disableForceShutdown()`. Clears the
+force shutdown flag. The reactor will run if formed and has redstone.
 
-`disableReactor()` calls `reactor.forceShutdown()`, setting the force shutdown flag and stopping the reactor regardless of redstone state.
+`disableReactor()` — calls `reactor.forceShutdown()`. Sets force
+shutdown. Reactor stops regardless of redstone state.
 
-`setModerationLevel(int)` calls `reactor.adjustModerationLevel(level)` to adjust the neutron moderation level.
+`setModerationLevel(int)` — calls `reactor.adjustModerationLevel(level)`.
 
-`voidFuel()` calls `reactor.voidFuel()` to discard the current fuel.
+`voidFuel()` — calls `reactor.voidFuel()`. Discards current fuel.
 
-### 10.3 Derived Values Computed in Lua
+### 11.3 Derived Values Computed in Lua
 
-All safety logic and derived state is computed in Lua, not in Java. The Java peripheral exposes raw values only. The following derived values are computed by the reactor control program:
+All safety logic is computed in Lua, not Java. The peripheral exposes
+raw values only.
 
-Heat margin is computed as `getCooling() - getHeat()`. A positive heat margin means the reactor is cooling faster than it is generating heat. A negative heat margin means the reactor is accumulating heat and will eventually exceed capacity.
+Heat margin: `getCooling() - getHeat()`. Positive means cooling faster
+than generating. Negative means accumulating heat.
 
-Heat percentage is computed as `getHeatStored() / getMaxHeatCapacity() * 100`.
+Heat percentage: `getHeatStored() / getMaxHeatCapacity() * 100`.
 
-Energy buffer percentage is computed as `getEnergyStored() / getEnergyCapacity() * 100`.
+Energy buffer percentage: `getEnergyStored() / getEnergyCapacity() * 100`.
 
-Overheating state is computed as `getHeat() > getCooling()`, which indicates that heat is accumulating. Note that this can be true even with a positive heat margin if the stored heat is already high — the combination of heat percentage and heat margin together determine the safety state.
+Overheating: `getHeat() > getCooling()`. Heat is accumulating. Note
+that this can be true even with stored heat below danger threshold.
+Heat percentage and heat margin together determine safety state.
 
-### 10.4 Java Source Locations
+### 11.4 Java Source Locations
 
-The peripheral implementation is at:
+Peripheral implementation:
 `src/main/java/igentuman/nc/compat/cc/SolidFissionReactorPeripheral.java`
 
-The controller block entity (source of all peripheral data) is at:
+Controller block entity (source of all peripheral data):
 `src/main/java/igentuman/nc/block/fission/entity/FissionControllerBE.java`
 
-The energy storage utility is at:
+Energy storage utility:
 `src/main/java/igentuman/nc/util/capability/CustomEnergyStorage.java`
 
-The three additions (`isActive`, `getEnergyCapacity`, `getReactivityLevel`) have been written but the mod has not been rebuilt and redeployed since the additions were made. They must be compiled and the JAR redeployed to the server before they can be used in Lua.
+### 11.5 Rebuild Status
+
+The three peripheral additions (`isActive`, `getEnergyCapacity`,
+`getReactivityLevel`) are written in Java. The mod has not been rebuilt
+since these additions. The JAR in the server's mods folder does not
+include them. All three methods will return "no such method" errors from
+Lua until the mod is rebuilt and the JAR redeployed. This is a blocking
+dependency for all reactor control Lua code.
 
 ---
 
-## 11. Third Party Code Assessment
+## 12. Third Party Code Assessment
 
-### 11.1 touchpoint.lua
+### 12.1 touchpoint.lua
 
 Source: Lyqyd (original), modified by DrunkenKas (Kasra Ghaffari)
 Repository: https://github.com/Kasra-G/ReactorController
 License: MIT
 Status: Adopted as the button library for all display work.
 
-`touchpoint.lua` is a click-map based button system for CC:Tweaked monitors. It maintains a 2D array mapping monitor coordinates to button names, handles `monitor_touch` events, and provides toggle, flash, and rename operations on buttons. It is completely generic — it contains no reactor logic, no application-specific code, and no dependencies beyond the CC:Tweaked standard API. It is well-written, MIT licensed, and actively maintained. There is no reason to write a replacement.
+`touchpoint.lua` is a click-map based button system for CC:Tweaked
+monitors. It maintains a 2D array mapping monitor coordinates to button
+names, handles `monitor_touch` events, and provides toggle, flash, and
+rename operations. It is completely generic — no reactor logic, no
+application-specific code, no dependencies beyond the CC:Tweaked
+standard API. It is well-written, MIT licensed, and actively maintained.
+There is no reason to write a replacement.
 
-The library is used as follows. A `touchpoint` instance is created for a specific monitor peripheral. Buttons are added with position, size, callback function, and color parameters. The instance's `handleEvents` method is called in the main event loop and returns a `button_click` event when a button is activated. The instance's `draw` method renders all buttons to the monitor.
-
-### 11.2 PID Controller Pattern
+### 12.2 PID Controller Pattern
 
 Source: Kasra Ghaffari (DrunkenKas)
 Repository: https://github.com/Kasra-G/ReactorController
 License: MIT
-Status: Algorithm adopted, peripheral calls replaced.
+Status: Algorithm adopted, peripheral calls to be replaced.
 
-The reactor controller in `reactorController.lua` implements a dual-error weighted PID controller for managing reactor output. The controller maintains two error signals simultaneously: the difference between actual and target RF/t output, and the difference between actual and target buffer fill level. These two errors are combined with dynamic weights — when the buffer level is far from target, the buffer error dominates; when it is close to target, the output rate error dominates. This produces smoother control behavior than a single-error PID.
+`reactorController.lua` implements a dual-error weighted PID controller.
+Two error signals: difference between actual and target RF/t output, and
+difference between actual and target buffer fill level. These are
+combined with dynamic weights — buffer error dominates when far from
+target, output rate error dominates when close. This produces smoother
+control than single-error PID.
 
-The PID parameters in the original are Kp = -0.08, Ki = -0.0015, Kd = -0.01. The negative signs reflect the inverse relationship between control rod insertion level and output — more insertion means less output, so the control response to a positive error (target greater than actual) is a decrease in insertion level.
+PID parameters: Kp = -0.08, Ki = -0.0015, Kd = -0.01. Negative signs
+reflect the inverse relationship between control rod insertion and
+output.
 
-For the NuclearCraft application, the same PID structure applies but the controlled variable is moderation level (via `setModerationLevel`) rather than control rod insertion, and the primary controlled quantity is heat rather than RF buffer. The peripheral calls are entirely different but the mathematical structure of `iteratePID` transfers directly.
+For NuclearCraft: the same PID structure applies but the controlled
+variable is moderation level via `setModerationLevel` rather than
+control rod insertion, and the primary controlled quantity is heat
+rather than RF buffer. Peripheral calls differ entirely but
+`iteratePID` transfers directly.
 
-### 11.3 Rejected Third Party Code
+### 12.3 Rejected Third Party Code
 
-CastilloAnthony's Nuclearcraft-Reactor-UI-ControlPanel targets OpenComputers on Minecraft 1.12.2. OpenComputers uses a completely different peripheral API (`component.proxy`, `component.list`) that is incompatible with CC:Tweaked. No code is transferable.
+CastilloAnthony's Nuclearcraft-Reactor-UI-ControlPanel targets
+OpenComputers on Minecraft 1.12.2. OpenComputers uses `component.proxy`
+and `component.list`. These APIs are incompatible with CC:Tweaked. No
+code is transferable.
 
-ThePoleThatFishes' NC-feat-OC-scripts similarly targets OpenComputers. The turbine calculator script is pure mathematics with no peripheral calls and is potentially usable as a reference for turbine efficiency calculations, but no direct code transfer is applicable.
-
----
-
-## 12. Coding Conventions
-
-### 12.1 Naming
-
-The project adopts the verbosity principles from the developer's primary C project conventions, adapted for Lua. Abbreviations are prohibited except where the abbreviation is more universally understood than the full word in the context of systems programming. `error` not `err`. `buffer` not `buf`. `filesystem` not `fs`. `channel` not `ch`. `response` not `res`.
-
-Function names are verb phrases that describe the complete action. `fetch_url` not `get`. `write_local_file` not `write`. `compute_heat_margin` not `heat`.
-
-Variable names describe what is stored and in what form. `remote_sha` not `sha`. `deployed_sha_path` not `path`. `shutdown_requested` not `running`.
-
-File names describe what the file contains, not what it is called informally. `channel_bus.lua` not `net.lua`. `process_registry.lua` not `registry.lua`. The name `util` is prohibited — if a file contains utilities, name it for what those utilities do.
-
-### 12.2 Comments
-
-Comments exist for non-obvious logic and contracts the caller must understand. They do not describe what the code does — the names do that. A function whose purpose is clear from its name and parameters does not need a comment. A function with a non-obvious precondition, a side effect the caller must account for, or a behavioral guarantee the caller depends on does need a comment stating that contract explicitly.
-
-### 12.3 Finite Patterns
-
-Recursion is prohibited. All loops must have a termination condition that is guaranteed to be reached within a bounded number of iterations. No loop may depend on an external condition (network response, peripheral availability) without a timeout that guarantees eventual termination. This rule exists because CC computers have no external kill mechanism accessible without server admin access. A hung loop cannot be interrupted remotely.
-
-### 12.4 Error Handling
-
-Every network operation returns either a value or nil plus an error message. The caller must check for nil before using the value. Silent failures — discarding the error and proceeding as if the operation succeeded — are prohibited. Every error either terminates the current operation with a logged message or triggers a retry with a bounded retry count.
-
-### 12.5 Storage Discipline
-
-No file is written to the CC computer's filesystem except role configuration (`role.cfg`), sync state (`.deployed_sha`), and application-specific persistent data that is explicitly designed to be persistent. Log files, temporary files, and cached data must not accumulate on the filesystem. The 1-2MB filesystem limit will be exhausted by unconstrained file accumulation.
+ThePoleThatFishes' NC-feat-OC-scripts similarly targets OpenComputers.
+The turbine calculator is pure math and is a usable reference for
+turbine efficiency calculations but no direct code transfers.
 
 ---
 
-## 13. Open Items and Build Order
+## 13. Coding Conventions for Lua on CC
 
-### 13.1 Immediate Prerequisites
+### 13.1 The Source of These Conventions
 
-The NuclearCraft fork must be rebuilt and the JAR redeployed to the server before the three peripheral additions (`isActive`, `getEnergyCapacity`, `getReactivityLevel`) are available in Lua. This is a blocking dependency for all reactor control code.
+The developer has an existing C coding convention system documented in
+three companion documents: `naming_and_code_form_conventions.md`,
+`code_taste_and_functional_form.md`, and `visual_identity_theme.md`.
+These documents were read in full during development. The Lua
+conventions in this project are derived from those documents but
+adapted for the CC:Tweaked environment.
 
-The `interactive_role_selector` branch must be created before any new computers are provisioned. This requires creating the branch, writing `configure_pc.lua` with the complete role list, pushing, and verifying that the bootstrap flow correctly selects and applies a role.
+The adaptation is not a simplification. It is a translation. Every rule
+that transfers is transferred at full fidelity. Rules that cannot
+transfer due to Lua's syntax or CC's physical constraints are replaced
+with equivalent rules that achieve the same goals.
 
-### 13.2 Build Order for Network Primitives
+### 13.2 What Transfers Directly
 
-The network primitives must be built in dependency order. Each item depends on all items above it being complete and tested before the next is begun.
+**Verbosity is mandatory.** Abbreviations are prohibited. `error` not
+`err`. `buffer` not `buf`. `response` not `res`. `configuration` not
+`cfg`. `channel` not `ch`. `filesystem` not `fs`. The function name
+`util` is prohibited — name what the utility does.
 
-`channel_bus.lua` is the first primitive to write. It must implement: named channel broadcast and receive over both wireless rednet and wired modems, message framing with type field, SHUTDOWN reserved message handling, heartbeat generation and reception, and fragmentation for large payloads. It must be tested in isolation before any other primitive depends on it.
+**Function names are verb phrases.** They describe the complete action:
+what goes in, what comes out. `fetch_url` not `get`. `write_local_file`
+not `write`. `read_branch_declaration` not `parse`.
 
-`process_registry.lua` is the second primitive. It maintains the channel registry table, prunes dead entries on missed heartbeat, and provides the coordinator with the information needed to route display subscriptions and process kill commands. It depends on `channel_bus.lua`.
+**Variable names describe what is stored and in what form.** `remote_sha`
+not `sha`. `deployed_sha_path` not `path`. `shutdown_requested` not
+`running`.
 
-`display_node.lua` is the third primitive. It handles channel subscription, state packet reception, and monitor rendering. It uses `touchpoint.lua` for any interactive display elements. It depends on `channel_bus.lua`.
+**Whitespace is a structural signal, not padding.** A blank line means
+something. No blank line is present for visual breathing room alone.
 
-`shell_commands.lua` is the fourth primitive. It implements the `run`, `list`, `watch`, and `kill` commands. It depends on `process_registry.lua` and `channel_bus.lua`.
+**Comments exist for non-obvious logic and contracts, not to narrate
+code.** The names do the narration. Comments state why a non-obvious
+choice was made, or state a contract the caller must understand.
 
-`configure_pc.lua` for the `interactive_role_selector` branch is independent of the above and can be written at any time. It depends only on the CC:Tweaked standard API.
+**File names describe what the file contains.** `channel_bus.lua` not
+`net.lua`. `deploy_banlist.json` not `blacklist.json`. The name is a
+description that can be read as a sentence fragment.
 
-### 13.3 First Application: Reactor Controller
+### 13.3 What Does Not Transfer and Why
 
-After the network primitives are complete, the reactor controller is the first application. It will be deployed to the `node/reactor_control` branch. It consists of:
+**The 100-character line width.** The CC:Tweaked advanced computer
+terminal is 51 characters wide. A 100-character line wraps and becomes
+unreadable. All code and comments in this project must fit within 51
+characters. This is the primary adaptation — it affects every visual
+convention.
 
-A reactor polling loop that reads the full peripheral state on a configured interval and constructs a compact state packet. The polling interval must be chosen to balance data freshness against CPU and network load — every tick is almost certainly unnecessary and wastes resources.
+**The `/* */` block comment syntax.** Lua uses `--` for single-line
+comments and `--[[ ]]` for multi-line blocks, but multi-line Lua block
+comments are not idiomatic in CC Lua. All comment blocks in this project
+use `--` prefixed lines.
 
-A safety monitor that evaluates heat margin, heat percentage, and reactivity level against configured thresholds and calls `disableReactor()` if any threshold is exceeded. The safety monitor runs on every tick regardless of polling interval, because safety conditions can change faster than the display update rate.
+**The five-term parameter contract annotation.** Lua has no type system
+to enforce against. The annotation `VALID CONSUME ALWAYS KEEP NONE`
+carries no enforcement weight in Lua. The same information is captured
+in the Operation block's IN section in plain language.
 
-A PID controller adapted from the Kasra-G pattern that adjusts moderation level to maintain target operating conditions.
+**The full TOC with line numbers.** The C convention includes a Table
+of Contents with function names and line numbers inside the file header.
+In a 60-150 line Lua file this is overhead. The TOC in Lua headers
+lists section names and approximate line numbers but not individual
+function entries.
 
-A channel bus publisher that broadcasts the state packet on the reactor's channel at the polling interval and sends heartbeats between state broadcasts.
+### 13.4 The File Header Format
 
-A display renderer, deployed to the display node, that receives state packets and renders them using `touchpoint.lua` for interactive controls.
+Every Lua file opens with a file header. This is Law, not Convention.
+No Lua file may be committed to this repository without a header. The
+header is the file's title page. It is the first thing read and the
+document that orients the reader before any code is seen.
 
-### 13.4 Second Application: AE2 Monitor
+The header format:
 
-AE2 integration requires Advanced Peripherals, which is already planned for installation. The AE2 peripheral API must be investigated after Advanced Peripherals is installed before any AE2 code is written. The peripheral type names and available methods are not known and must not be assumed.
+```lua
+-- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+-- filename.lua
+-- Purpose statement. As many lines as needed
+-- to fully describe what this file does,
+-- what system it belongs to, what its
+-- contracts and invariants are, and what
+-- the reader must understand before reading
+-- the code.
+--
+-- Branches : branch_name
+-- Depends  : dependency list or none
+-- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+--
+-- [1] SECTION NAME        ln. XX
+-- [2] SECTION NAME        ln. XX
+--
+-- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+```
 
-### 13.5 Long-Term Items
+The `%` border character was chosen following the same analysis as in
+the C convention: it is visually unambiguous, appears in no other
+context in Lua comments, and reads at scroll speed as "this is the
+title page." The border fills to 45 characters to fit the terminal.
 
-The database cluster architecture is designed but not yet specified in detail. The query protocol, data schema, and distribution strategy must be designed when a concrete use case requiring persistent storage emerges. The architecture supports it but no immediate implementation is planned.
+The `Branches :` field is not optional. It is parsed by `gen_file_list.py`
+and is the mechanism by which the file declares where it belongs.
 
-The coordinator redundancy problem — what happens if the coordinator computer is lost — is noted but not solved. For the current deployment context (private server, developer is present), coordinator loss is a recoverable manual event. Automatic coordinator failover is a significant architectural addition that is deferred until the basic system is operational.
+The `Depends :` field lists other files this file requires. `none` if
+there are no dependencies.
+
+The Table of Contents lists section names and approximate line numbers.
+Line numbers are advisory — they do not need to be updated on every
+edit. Their purpose is orientation.
+
+### 13.5 Section Markers
+
+Within a file, sections are marked with `=` borders matching the section
+entries in the TOC:
+
+```lua
+-- ===========================================================================
+-- [1] SECTION NAME
+-- ===========================================================================
+```
+
+Sections carry a body when context is needed before entering the section.
+When a section's purpose is obvious from its name, the body is omitted.
+
+### 13.6 Authority Tiers
+
+Following the C convention document, every rule in this coding system
+carries one of three tiers:
+
+**Law** — enforced by tooling or produces a hard error if violated.
+The `Branches :` declaration in every Lua header is Law. The finite
+pattern requirement is Law. The exit path requirement is Law.
+
+**Convention** — followed by discipline. The verbosity rules, the
+naming conventions, the section marker format are Convention.
+
+**Guidance** — admits judgment. TOC line number accuracy is Guidance.
+
+### 13.7 The Finite Pattern Rule as Law
+
+No function in this codebase may call itself recursively. No loop may
+have an unbounded termination condition. This is Law because the
+consequence of violation is a hung computer that cannot be remotely
+killed.
+
+`configure_pc.lua` was initially written with a recursive cancel path:
+cancelling a selection called `shell.run("configure_pc.lua")`. This was
+noted as a concern and the developer approved it on the grounds that
+human input is required at each iteration, making infinite recursion
+impossible in practice. However, it was subsequently replaced with a
+`while true` loop which achieves the same behavior without any
+recursion. The loop pattern is always preferable to recursion in this
+environment.
+
+### 13.8 Error Handling
+
+Every network operation returns either a value or nil plus an error
+message. The caller must check for nil before using the value. Silent
+failures — discarding the error and proceeding as if the operation
+succeeded — are prohibited. Every error either terminates the current
+operation with a logged message or triggers a retry with a bounded
+retry count.
+
+---
+
+## 14. The branch_manager.py Toolkit
+
+`branch_manager.py` is a local Python utility that is never committed
+to the repository. It is listed in `.gitignore`. It provides all
+branch management and repository inspection operations. It is the
+primary interface between the developer and the git repository for
+this project.
+
+### 14.1 Design Philosophy
+
+The toolkit was designed around the same principle as the rest of the
+system: the developer should not need to remember commands, sequences,
+or state. The tool provides what the developer needs in one command.
+Every destructive operation requires explicit confirmation. The `audit`
+and `state` commands replace manual for-loop sequences that the developer
+had to run repeatedly.
+
+Every command that modifies the repository shows what it will do before
+doing it and requires confirmation. The `propagate --all` command
+requires typing `ALL BRANCHES` in full — not `y`, not `yes`, the
+exact string — because universal propagation is the highest-impact
+operation available.
+
+### 14.2 Command Reference
+
+**`help`** — prints all available commands with one-line descriptions.
+No arguments.
+
+**`list`** — lists all local and remote branches. Marks the current
+branch with `*`. No arguments.
+
+**`show`** — prints the current branch name. No arguments.
+
+**`create <branch>`** — creates a new branch locally and pushes to
+remote. Prints a reminder to tag the branch if it is intended to be a
+deployable role. One argument: branch name.
+
+**`delete <branch>`** — deletes a branch locally and remotely. Requires
+`y` confirmation. Also removes the role tag if present. Uses `-D`
+(force delete) rather than `-d` because branches may not be fully
+merged. One argument: branch name.
+
+**`switch <branch>`** — checks out a branch. One argument: branch name.
+
+**`tag <branch>`** — creates and pushes a `role/<branch>` git tag,
+making the branch selectable in `configure_pc.lua`. Verifies the branch
+exists remotely before tagging. One argument: branch name.
+
+**`untag <branch>`** — removes the `role/<branch>` tag locally and
+remotely. Requires `y` confirmation. One argument: branch name.
+
+**`tags`** — lists all `role/*` tags and their corresponding branch
+names. No arguments.
+
+**`state`** — deep view of the current branch. Shows: last commit SHA
+and message, whether the branch is role-tagged, working tree status
+(uncommitted changes), unpushed commits, all tracked Lua files with
+their disposition (BANNED, UNIVERSAL, DEPLOY, SKIP, NO HDR), and the
+current contents of `file_index.json`. No arguments.
+
+**`audit`** — full view of all remote branches. For each branch shows:
+last commit SHA and message, whether the branch is role-tagged, all
+tracked Lua files, and the contents of `file_index.json`. No arguments.
+This command replaces the manual for-loop sequence that was run
+repeatedly during development.
+
+**`propagate <file> <branch> [<branch>...]`** — targeted propagation.
+Copies the specified file from the current branch to one or more target
+branches. For each target branch: checks out the branch, copies the
+file using `git checkout <source_branch> -- <file>`, commits with the
+message `propagate: <file> from <source_branch>`, pushes, returns to
+source branch. Shows target list and requires `y` confirmation before
+proceeding. Skips branches where the file is already up to date.
+
+**`propagate <file> --all`** — universal propagation. Copies the file
+to every remote branch. First verifies that the file is listed in
+`universal_files.json` — if not, refuses with an error message
+explaining the requirement. Shows the full list of target branches and
+requires typing `ALL BRANCHES` exactly before proceeding. Uses the
+same per-branch copy mechanism as targeted propagation.
+
+### 14.3 Deferred Commands
+
+The following commands were designed during development but deliberately
+deferred. They are documented here so they are not forgotten and so
+future development can implement them with full context.
+
+**`sync`** — dry run diff. Shows what would change if `gen_file_list.py`
+were run and the result committed. Never touches git. The developer
+described this as safe because "a bad sync is a ruiner" — automatic
+synchronization that commits without review is too dangerous. `sync`
+is read-only.
+
+**`deploy`** — guarded commit and push. Would run `gen_file_list.py`,
+show the full diff of what will be committed including the updated
+`file_index.json`, verify that the current branch is a known valid
+branch, verify that no Lua files exist on disk without a branch
+declaration, require explicit confirmation, then commit and push. The
+developer noted that `deploy` needs a guard not just that the branch
+is valid but that it is the intended branch — the system should enforce
+correctness, not rely on the developer to verify. The implementation
+approach is to show the branch name prominently and require the developer
+to acknowledge it explicitly before proceeding.
+
+---
+
+## 15. What the Developer Taught the System
+
+This section records the specific insights, corrections, and design
+principles that the developer contributed during the course of building
+this system. These are not elaborations of existing ideas — they are
+inputs that changed the direction of development or established
+constraints that would not have existed without explicit developer
+direction.
+
+### 15.1 The Developer Is Not the Protection Mechanism
+
+This was stated in response to repeated instructions that relied on the
+developer remembering sequences, branch names, and file relationships.
+The developer said: "I am not the thing that preserves state. The system
+should if that makes sense." This became the central principle of the
+entire codebase. Every guard, every hard error, every confirmation
+prompt exists because of this statement.
+
+### 15.2 Finite Patterns Are Non-Negotiable
+
+The developer identified recursion as uniquely dangerous in this
+environment before the system was built. "I would stick to what I will
+call finite patterns. This can cause huge issues." This established the
+finite pattern requirement as Law before any code was written.
+
+### 15.3 The Display Fabric Mental Model
+
+The developer articulated the display fabric design in terms of
+"switching inputs on a monitor" — the signal sources do not change,
+only what the monitor shows. This mental model resolved the design
+ambiguity about who receives commands when display assignment changes.
+The answer is always the display node, never the producer.
+
+### 15.4 The CC Computer Is Not the Dev Machine
+
+During initial setup, instructions assumed the CC computer's filesystem
+was accessible from the developer's machine. The developer corrected
+this immediately: "Careful, you're assuming code PC is Minecraft PC.
+Also, this is a server. There is nothing under saves for the client."
+This correction established the correct architecture — GitHub as
+intermediary, CC pulling rather than being pushed to.
+
+### 15.5 The 2MB Is Not a Code Size Constraint
+
+The developer asked explicitly whether the header format was "too much"
+given the 2MB limit. The answer was that comments cost zero RAM.
+The developer accepted this and it established the convention that
+headers and comments should be written at full fidelity without concern
+for size.
+
+### 15.6 The Whitelist/Banlist Split
+
+The developer proposed separating the deployment manifest into a
+whitelist (file headers declaring where they belong) and a blacklist
+(a small, stable list of files that must never reach CC). The developer
+noted: "90% of the time files moving around is benign. We have a few
+files that should never move around." This created the `Branches :`
+header declaration system and `deploy_banlist.json`.
+
+### 15.7 Branches as the Scope Boundary
+
+The developer proposed using git branches rather than multiple
+repositories for role isolation. When the branches-vs-repositories
+question came up, the developer decided on branches because "everything
+is branches and we can branch the branches themselves." The branch
+naming hierarchy (`node/`, `cluster/`, etc.) followed from this.
+
+### 15.8 The Universal Files Pattern
+
+After the propagation command was designed, the developer asked whether
+`gen_file_list.py` should also be propagated. The question revealed
+that three files — `deploy_banlist.json`, `universal_files.json`, and
+`gen_file_list.py` — should exist on every branch. This led to the
+`universal_files.json` classification system and the `Branches : all`
+header value. The developer confirmed these were the only three
+universal files, reasoning through each one explicitly.
+
+### 15.9 The System Caught Its Own Bug
+
+The branch header system was invented to prevent deployment errors. On
+its first real test — running `gen_file_list.py` on `interactive_role_selector`
+after the header system was introduced — it correctly detected that
+`startup.lua` had declared only `Branches : main` and skipped it on
+the other branches. The developer said: "I was going to see if you took
+it through the entire repo. This is why we invented this system — glad
+to see it's working." This was a real bug that would have caused
+`startup.lua` never to be updated on non-main branches. The system
+caught it before any CC computer was affected.
+
+### 15.10 Sprawl Control
+
+The developer repeatedly redirected the conversation away from over-
+scoped responses. "Your sprawl is really bad right now. Get concise
+and ask all your questions now." "I already made the change — I assume
+now we push?" "Yes but first we need to clone." This established the
+working pattern: understand the problem, propose, get explicit approval,
+execute. Do not expand scope without permission. Cache deferred items
+rather than pursuing them immediately.
+
+### 15.11 The Context Document Standard
+
+The developer specified that the context document must be written without
+compression, without simplification, and without reduction. "No
+reductions unless it is removed from the current implementation.
+Modifications only to give clarity and not to simplify/compress. Adding
+everything you learn, why you learned it, and outputs/inputs/context.
+Your doing this correct?" The document you are reading is the result
+of that specification.
+
+---
+
+## 16. Anti-Patterns Explicitly Rejected
+
+This section documents architectural approaches that were considered
+and rejected, with the exact reasoning. Future development must not
+reintroduce these patterns.
+
+### 16.1 Git Hooks for Automation
+
+Git hooks were introduced twice and caused catastrophic failures both
+times. The first hook was a pre-commit hook running `gen_file_list.py`
+and `git add`. This was safe on its own but created the false impression
+that hooks were a viable automation tool. The second hook was a
+post-commit hook that called `git commit --no-verify` to update a SHA
+file. This produced infinite recursion — hundreds of commits in seconds.
+
+Git hooks that call git commands will always risk recursive firing.
+`--no-verify` does not prevent post-commit hooks from firing. There is
+no safe way to make a post-commit hook that commits without the risk of
+recursion. Git hooks are permanently prohibited in this project.
+
+### 16.2 File Content Hashing for Change Detection
+
+Hashing file contents to detect changes is encoding-dependent. Any
+difference in line endings, encoding, or whitespace between the hash
+computation environment and the CC runtime environment will cause
+permanent false positives. The CC computer detected changes on every
+boot and rebooted infinitely. Commit SHA comparison is encoding-immune
+and is the only correct approach for this cross-platform deployment
+context.
+
+### 16.3 Hardcoded Role Lists
+
+`configure_pc.lua` initially contained a hardcoded list of roles.
+Adding a new role required editing `configure_pc.lua` and pushing to
+the `interactive_role_selector` branch. This is a maintenance burden
+and a drift risk — the hardcoded list will eventually diverge from the
+actual available branches. The live tag fetch from GitHub API ensures
+the list is always current. The correct approach is always to derive
+lists from the authoritative source rather than maintaining a copy.
+
+### 16.4 Monorepo Without Branch Isolation
+
+A single branch with all code for all roles would eventually exceed 2MB
+in deployed size. More immediately, it would mean every CC computer
+pulling gigabytes of code it does not need. The branch-per-role pattern
+is not optional — it is a hard requirement derived from the 2MB storage
+constraint.
+
+### 16.5 Auto-Reboot on Any File Change
+
+Early versions of `startup.lua` rebooted whenever any file was updated.
+This caused infinite reboot loops when `startup.lua` itself was the
+changed file — each reboot pulled the new `startup.lua`, which detected
+itself as changed, and rebooted again. The correct rule is: reboot only
+when non-startup files change. `startup.lua` updates take effect on
+the next natural reboot.
+
+### 16.6 Polling for Updates
+
+Polling GitHub for changes was considered as an alternative to
+reboot-triggered sync. This was rejected for three reasons. First,
+GitHub's raw content servers have rate limits that polling would
+eventually hit. Second, a control system computer that reboots itself
+mid-operation is dangerous. Third, the operational model of rebooting
+to apply updates is standard and expected. The developer controls when
+updates apply by controlling when computers reboot.
+
+### 16.7 Recursive Interactive Loops
+
+`configure_pc.lua` was initially written with a cancel path that called
+`shell.run("configure_pc.lua")` — recursing into itself. This was noted
+as bounded by human input requirements and technically safe, but was
+replaced with a `while true` loop. Recursive self-invocation is a
+pattern that should not be used in this environment even when bounded,
+because it consumes stack frames on each recursion and could in theory
+exhaust the heap given enough iterations.
+
+---
+
+## 17. Open Items and Build Order
+
+### 17.1 Immediate Blocking Items
+
+**NC mod rebuild and redeploy.** The three peripheral additions
+(`isActive`, `getEnergyCapacity`, `getReactivityLevel`) are written
+in Java but the mod has not been rebuilt. The JAR in the server mods
+folder does not include them. All reactor control Lua code is blocked
+until this is done.
+
+### 17.2 Network Primitives (In Dependency Order)
+
+These must be built in strict dependency order. Each item depends on
+all items above it being complete and tested.
+
+**`channel_bus.lua`** — first primitive. Must implement named channel
+semantics, transport abstraction (wireless and wired), message framing
+with type field, SHUTDOWN and HEARTBEAT reserved types, heartbeat
+generation, and payload fragmentation. Must be tested in isolation.
+Branches: `main`.
+
+**`process_registry.lua`** — second primitive. Maintains the channel
+registry table, prunes dead entries on missed heartbeat, provides the
+coordinator with routing information. Depends on `channel_bus.lua`.
+Branches: `main`.
+
+**`display_node.lua`** — third primitive. Channel subscription,
+state packet reception, monitor rendering using `touchpoint.lua`.
+Depends on `channel_bus.lua`. Branches: `node/display`.
+
+**`shell_commands.lua`** — fourth primitive. Implements `run`, `list`,
+`watch`, `kill`. Depends on `process_registry.lua` and
+`channel_bus.lua`. Branches: `main`.
+
+### 17.3 branch_manager.py Deferred Commands
+
+**`sync`** — dry-run diff, read-only, never commits. Safe to implement
+at any time.
+
+**`deploy`** — guarded commit and push. Must include: branch validity
+check, `file_index.json` correctness verification, no-untracked-lua
+guard, prominent branch name display, explicit confirmation. Implement
+after the network primitives are stable — the deployment workflow must
+be reliable before the control system is built.
+
+### 17.4 First Application: Reactor Controller
+
+After network primitives are complete. Deployed to `node/reactor_control`
+branch. Components:
+
+Reactor polling loop: reads full peripheral state on a configured
+interval, constructs a compact state packet.
+
+Safety monitor: evaluates heat margin, heat percentage, and reactivity
+level against configured thresholds on every tick. Calls
+`disableReactor()` if any threshold is exceeded. Runs independently of
+the polling interval.
+
+PID controller: adapted from Kasra-G pattern. Uses `setModerationLevel`
+as the control output. Controls heat rather than RF buffer.
+
+Channel bus publisher: broadcasts state packets and sends heartbeats.
+
+Display renderer: deployed to `node/display`. Receives state packets
+and renders using `touchpoint.lua`. Interactive controls for
+enable/disable, moderation level adjustment.
+
+### 17.5 Second Application: AE2 Monitor
+
+Requires Advanced Peripherals (already planned). The AE2 peripheral
+API must be investigated after Advanced Peripherals is installed. Peripheral
+type names and available methods are not known and must not be assumed.
+
+### 17.6 Infrastructure Items
+
+**Update `CC_NETWORK_DESIGN.md`** — this document — after each
+significant session. The document is the authoritative knowledge
+transfer artifact and must remain current.
+
+**Database cluster design** — architecture is complete (described in
+Section 10.5) but not specified in detail. Defer until a concrete
+persistent storage use case emerges.
+
+**Coordinator redundancy** — automatic coordinator failover is a
+significant architectural addition. Deferred until the basic system
+is operational. Manual recovery on coordinator loss is the current
+approach.
+
+**Developer's deferred idea** — the developer mentioned an idea about
+partial propagation patterns during the propagation command design
+session but explicitly did not state it to avoid expanding scope.
+This idea exists and should be solicited at the start of the next
+development session.

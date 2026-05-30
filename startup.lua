@@ -13,7 +13,11 @@
 -- configure_pc.lua to assign a role.
 --
 -- Branches : main, interactive_role_selector,
---            node/test
+--            node/test, node/reactor-builder,
+--            reactor-1, reactor-2, reactor-3,
+--            reactor-4, reactor-5, reactor-6,
+--            reactor-7, reactor-8, reactor-9,
+--            reactor-10
 -- Depends  : none
 -- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 --

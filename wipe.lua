@@ -1,32 +1,27 @@
+-- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 -- wipe.lua
--- Emergency full wipe of this computer's filesystem.
--- Deletes everything except the protected rom directory.
--- Does NOT reboot automatically -- that is the developer's decision.
--- After wiping, paste the bootstrap one-liner to reinitialize.
+-- Emergency full filesystem wipe utility.
+-- Deletes everything on this computer except
+-- the protected rom directory. Does not reboot
+-- automatically. After wiping, paste the
+-- bootstrap one-liner to reinitialize.
+-- Use only when the computer is in a state
+-- that cannot be repaired by normal recovery.
 --
--- Run with: shell.run("wipe.lua")
--- Or fetch directly:
---   local r=http.get("https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/interactive_role_selector/wipe.lua")
---   local f=fs.open("wipe.lua","w") f.write(r.readAll()) f.close() r.close()
---   shell.run("wipe.lua")
+-- Branches : interactive_role_selector
+-- Depends  : none
+-- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+--
+-- [1] WIPE                ln. 20
+-- [2] ENTRY POINT         ln. 40
+--
+-- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+-- ===========================================================================
+-- [1] WIPE
+-- ===========================================================================
 
 local PROTECTED_DIRECTORIES = { rom = true }
-
-local function confirm_wipe()
-    print("=========================================")
-    print("           EMERGENCY WIPE UTILITY        ")
-    print("=========================================")
-    print("")
-    print("This will delete ALL files on this computer")
-    print("except the protected rom directory.")
-    print("")
-    print("After wiping, paste the bootstrap one-liner")
-    print("to reinitialize.")
-    print("")
-    io.write("Type WIPE to confirm, or anything else to cancel: ")
-    local input = io.read()
-    return input == "WIPE"
-end
 
 local function wipe_filesystem()
     local deleted_count = 0
@@ -40,9 +35,22 @@ local function wipe_filesystem()
     return deleted_count
 end
 
-if not confirm_wipe() then
+-- ===========================================================================
+-- [2] ENTRY POINT
+-- ===========================================================================
+
+print("=========================================")
+print("         EMERGENCY WIPE UTILITY          ")
+print("=========================================")
+print("")
+print("Deletes ALL files except rom.")
+print("")
+io.write("Type WIPE to confirm, anything else cancels: ")
+local input = io.read()
+
+if input ~= "WIPE" then
     print("")
-    print("Wipe cancelled. No files were deleted.")
+    print("Wipe cancelled. No files deleted.")
     return
 end
 
@@ -53,9 +61,11 @@ local deleted_count = wipe_filesystem()
 print("")
 print("Wipe complete. " .. deleted_count .. " item(s) deleted.")
 print("")
-print("Paste the bootstrap one-liner to reinitialize:")
+print("Paste bootstrap one-liner to reinitialize:")
 print("")
-print('local r=http.get("https://raw.githubusercontent.com/ZacharyTPerry-lang/cc-repo/main/bootstrap.lua")')
-print('local f=fs.open("bootstrap.lua","w") f.write(r.readAll()) f.close() r.close()')
+print('local r=http.get("https://raw.githubusercontent.com/')
+print('ZacharyTPerry-lang/cc-repo/main/bootstrap.lua")')
+print('local f=fs.open("bootstrap.lua","w")')
+print('f.write(r.readAll()) f.close() r.close()')
 print('shell.run("bootstrap.lua")')
 print("")

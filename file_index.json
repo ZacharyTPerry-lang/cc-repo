@@ -1,5 +1,8 @@
 {
   "files": [
+    "lib/base64.lua",
+    "lib/github.lua",
+    "programs/main.lua",
     "startup.lua"
   ]
 }

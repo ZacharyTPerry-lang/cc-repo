@@ -2,13 +2,15 @@
 -- lib/github.lua
 -- GitHub Contents API helpers for reading
 -- and writing files on cc-repo. Used by the
--- reactor builder to update job_meta.json
--- with build progress and final status.
+-- reactor builder to claim slots and update
+-- job_meta.json with build progress.
 -- Requires a fine-grained token with
 -- Contents: Read and Write on cc-repo.
 --
--- await_http_response uses a bounded timer
--- so no call can block indefinitely.
+-- await_http_response requeues unrecognised
+-- events so parallel.waitForAny callers
+-- do not lose key/char events while an HTTP
+-- request is in flight.
 --
 -- Branches : reactor-1, reactor-2,
 --            reactor-3, reactor-4,
@@ -18,9 +20,9 @@
 -- Depends  : lib/base64
 -- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 --
--- [1] CONFIGURATION       ln. 28
--- [2] HTTP HELPERS        ln. 42
--- [3] CONTENTS API        ln. 90
+-- [1] CONFIGURATION       ln. 30
+-- [2] HTTP HELPERS        ln. 45
+-- [3] CONTENTS API        ln. 105
 --
 -- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -30,23 +32,23 @@
 
 local base64 = require("lib.base64")
 
-local REPO_OWNER   = "ZacharyTPerry-lang"
-local REPO_NAME    = "cc-repo"
-local API_ROOT     = "https://api.github.com"
-local CONTENTS_URL = API_ROOT
-    .. "/repos/"
+local REPO_OWNER    = "ZacharyTPerry-lang"
+local REPO_NAME     = "cc-repo"
+local API_ROOT      = "https://api.github.com"
+local CONTENTS_PATH =
+    "/repos/"
     .. REPO_OWNER .. "/" .. REPO_NAME
     .. "/contents/"
-local HTTP_TIMEOUT = 30
+local HTTP_TIMEOUT  = 30
 
 -- =========================================
 -- [2] HTTP HELPERS
 -- =========================================
 
 -- build_auth_headers
--- Returns the header table required by
--- every GitHub API call. Includes the
--- personal access token for write access.
+-- Returns headers required by every GitHub
+-- API call, including the personal access
+-- token for authenticated write access.
 local function build_auth_headers(token)
     return {
         ["Authorization"]  =
@@ -59,30 +61,45 @@ local function build_auth_headers(token)
 end
 
 -- await_http_response
--- Waits for an http_success or http_failure
--- event matching the given URL. A timer
--- guarantees termination within
--- HTTP_TIMEOUT seconds regardless of
--- network conditions. Returns body, success.
+-- Waits for http_success or http_failure
+-- matching the given URL, with a bounded
+-- timeout. Returns body, success, http_code.
+--
+-- Unrecognised events (key, char, redraw,
+-- etc.) are requeued via os.queueEvent so
+-- that parallel.waitForAny coroutines such
+-- as io.read() are not starved of input
+-- events while an HTTP request is in flight.
 local function await_http_response(url)
     local timer_id =
         os.startTimer(HTTP_TIMEOUT)
     while true do
-        local event, param1, param2 =
-            os.pullEvent()
+        local event, p1, p2, p3 =
+            os.pullEventRaw()
         if event == "http_success"
-                and param1 == url then
-            local body = param2.readAll()
-            param2.close()
+                and p1 == url then
+            local code = p2.getResponseCode()
+            local body = p2.readAll()
+            p2.close()
             os.cancelTimer(timer_id)
-            return body, true
+            return body, true, code
         elseif event == "http_failure"
-                and param1 == url then
+                and p1 == url then
             os.cancelTimer(timer_id)
-            return tostring(param2), false
+            return tostring(p2), false, 0
         elseif event == "timer"
-                and param1 == timer_id then
-            return "http timeout", false
+                and p1 == timer_id then
+            return "http timeout", false, 0
+        elseif event == "terminate" then
+            -- Propagate terminate so pcall
+            -- callers can handle Ctrl+T.
+            os.cancelTimer(timer_id)
+            error("Terminated")
+        else
+            -- Requeue so other coroutines
+            -- (io.read, movement, etc.)
+            -- are not starved of events.
+            os.queueEvent(event, p1, p2, p3)
         end
     end
 end
@@ -92,47 +109,46 @@ end
 -- =========================================
 
 -- fetch_file_with_sha
--- Fetches file_path from the given branch
--- via the GitHub Contents API (authenticated
--- so rate limit is 5000/hour).
--- Returns parsed_data, sha, error_string.
--- The sha field is required for update_file.
+-- Fetches file_path from branch via the
+-- GitHub Contents API (authenticated).
+-- Returns data_table, sha, error_string.
+-- sha is required for subsequent updates.
+-- The data table contains the raw API
+-- response; content is base64 encoded.
 local function fetch_file_with_sha(
         file_path, branch, token)
-    local url = CONTENTS_URL
+    local url = API_ROOT .. CONTENTS_PATH
         .. file_path
         .. "?ref=" .. branch
     local headers = build_auth_headers(token)
-
     http.request({
         url     = url,
         headers = headers,
         method  = "GET",
     })
-
-    local body, success =
+    local body, success, _ =
         await_http_response(url)
     if not success then
         return nil, nil, body
     end
-
     local data =
         textutils.unserialiseJSON(body)
     if not data or not data.sha then
         return nil, nil, "parse failed"
     end
-
     return data, data.sha, nil
 end
 
 -- update_file
 -- Writes new_content_string to file_path
--- on branch via a GitHub Contents API PUT.
--- current_sha must be the sha returned by
--- the previous fetch or update; GitHub
--- rejects updates without the current sha.
--- Returns new_sha, error_string.
--- new_sha must be used for the next update.
+-- on branch. current_sha must match the
+-- latest SHA or GitHub returns 409.
+-- Returns new_sha, error_string, http_code.
+--
+-- Callers use http_code to distinguish:
+--   200 = success
+--   409 = SHA conflict (race condition)
+--   0   = network/timeout error
 local function update_file(
         file_path,
         branch,
@@ -140,7 +156,8 @@ local function update_file(
         current_sha,
         token,
         commit_message)
-    local url = CONTENTS_URL .. file_path
+    local url = API_ROOT .. CONTENTS_PATH
+        .. file_path
     local headers = build_auth_headers(token)
     local encoded =
         base64.encode(new_content_string)
@@ -150,29 +167,25 @@ local function update_file(
         sha     = current_sha,
         branch  = branch,
     })
-
     http.request({
         url     = url,
         body    = body,
         headers = headers,
         method  = "PUT",
     })
-
-    local response, success =
+    local response, success, http_code =
         await_http_response(url)
     if not success then
-        return nil, response
+        return nil, response, http_code
     end
-
     local data =
         textutils.unserialiseJSON(response)
     if not data
             or not data.content
             or not data.content.sha then
-        return nil, "response parse failed"
+        return nil, "parse failed", http_code
     end
-
-    return data.content.sha, nil
+    return data.content.sha, nil, http_code
 end
 
 return {

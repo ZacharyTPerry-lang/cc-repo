@@ -1,5 +1,6 @@
 {
   "files": [
+    "programs/main.lua",
     "startup.lua"
   ]
 }
